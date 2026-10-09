@@ -224,6 +224,10 @@ const DEG = Math.PI / 180;
 const C = (hex) => new THREE.Color(hex);
 const V3 = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
 
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+// lets a frame render between the heavy steps of building a painting
+const breathe = () => nextFrame();
+
 function mulberry(seed) {
   let a = seed >>> 0;
   return function () {
@@ -252,15 +256,6 @@ function jfbm(x, y, oct = 4) {
   for (let i = 0; i < oct; i++) { s += a * jnoise(x, y); n += a; x = x * 2.03 + 17.1; y = y * 2.03 + 9.2; a *= 0.5; }
   return s / n;
 }
-
-// Sky helpers. Azimuth 0 looks down -Z, positive azimuth turns toward +X. Degrees in, radians out.
-function dirAzEl(az, el) {
-  const a = az * DEG, e = el * DEG;
-  return V3(Math.sin(a) * Math.cos(e), Math.sin(e), -Math.cos(a) * Math.cos(e));
-}
-// Stereographic sky coordinate (projects the upper hemisphere into the unit disc, conformal).
-function skyS(az, el) { const d = dirAzEl(az, el); return new THREE.Vector2(d.x / (1 + d.y), d.z / (1 + d.y)); }
-function skyR(el, radiusDeg) { return (radiusDeg * DEG) / (1 + Math.sin(el * DEG)); }
 
 function matAt(x = 0, y = 0, z = 0, ry = 0, sx = 1, sy = sx, sz = sx, rx = 0, rz = 0) {
   const m = new THREE.Matrix4();
@@ -418,7 +413,6 @@ uniform int uPLn;
 uniform float uBeamOn;
 uniform vec3 uWinMin;
 uniform vec3 uWinMax;
-uniform float uCellPx;
 
 float pointLights(vec3 P, vec3 N, out vec3 tint){
   float w = 0.0; vec3 acc = vec3(0.0);
@@ -476,15 +470,15 @@ uniform float uFlowAmt;
 uniform float uFlowRate;
 uniform float uRelief;
 uniform float uDetail;
-uniform float uMirrorSky;
-uniform float uMirrorLand;
 uniform float uShimmer;
 uniform float uDiscardFar;
-uniform vec2 uBands;   // heights of the sky band (top) and land band (bottom) in canvas v
-uniform vec2 uExtNear; // distances over which the extended canvas takes over nearby ground (start, full)
+uniform vec2 uExtNear; // distances from the painter over which near-ground brushwork hands over to the far field
+uniform float uAspect;
+uniform float uBand;   // width of the cross-fade inside the frame, in canvas heights
 
 vec2 canvasUV(vec3 P, out float depth){ vec4 c = uC0VP * vec4(P, 1.0); depth = c.w; return c.xy / max(c.w, 1e-4) * 0.5 + 0.5; }
 vec2 canvasUVDir(vec3 d, out float front){ vec3 c = uC0R * d; front = -c.z; return vec2(c.x / max(-c.z, 1e-4) / uC0Tan.x, c.y / max(-c.z, 1e-4) / uC0Tan.y) * 0.5 + 0.5; }
+// signed distance to the frame edge in canvas heights (negative inside)
 float frameDist(vec2 uv){ vec2 o = max(-uv, uv - 1.0); return max(o.x * uC0Tan.x / uC0Tan.y, o.y); }
 bool inFrame(vec2 uv){ return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0; }
 int topLayer(vec2 uv){ vec3 L = texture(uLabels, uv).rgb; return L.b > 0.5 ? 3 : (L.g > 0.5 ? 2 : (L.r > 0.5 ? 1 : 0)); }
@@ -504,6 +498,14 @@ vec3 paintAt(vec2 uv){
 }
 vec3 paintBlur(vec2 uv, float lod){ return textureLod(uPaint, clamp(uv, 0.002, 0.998), lod).rgb; }
 float paintRelief(vec2 uv){ return 0.5 + (lum(texture(uPaint, uv).rgb) - lum(textureLod(uPaint, uv, 2.5).rgb)) * uRelief; }
+// how much of the painting itself shows: 1 inside, 0 at and beyond the frame, an uneven band between
+float paintWeight(vec2 uv, float fd){
+  vec2 q = uv * vec2(uAspect, 1.0);
+  float n = vnoise(q * 7.0) * 0.6 + vnoise(q * 19.0 + 4.0) * 0.4;
+  return 1.0 - smoothstep(-uBand, 0.0, fd + uBand * 0.7 * n);
+}
+// 1 on the canvas, falling off with distance from it (drives the arrival reveal and the impasto blend)
+float frameMask(float fd){ return exp(-max(fd, 0.0) * 4.0); }
 bool fillValid(int layer, vec2 uv){ return layer != 1 || texture(uLabels, uv).a > 0.5; }
 vec3 fillAt(int layer, vec2 uv){ return layer == 0 ? texture(uFillA, uv).rgb : (layer == 1 ? texture(uFillB, uv).rgb : textureLod(uPaint, uv, 3.0).rgb); }
 
@@ -550,12 +552,13 @@ vec2 canvasDir(vec2 uv, int layer){
   return vec2(cos(a), sin(a));
 }
 // When you walk close, crisp brushstrokes in Vincent's colours and directions take over from the magnified scan.
+// Fills are stored at a third of the painting's resolution, so they get their strokes three times sooner.
 vec4 canvasDetail(vec2 uv, int layer, int mode, inout vec3 col, inout float h){
   bool fromFill = mode == 1;
   vec2 ppx = uv * uPaintPx;
   float tpp = length(fwidth(ppx));
   float mag = 1.0 / max(tpp, 1e-4);
-  float amt = mode > 0 ? 1.0 : smoothstep(1.3, 2.6, mag) * uDetail;
+  float amt = smoothstep(1.3, 2.6, mode > 0 ? mag * 3.0 : mag) * uDetail;
   if (amt <= 0.001) return vec4(0.0);
   vec2 d = canvasDir(uv, layer);
   float S = clamp(20.0 / mag, 2.2, 13.0);
@@ -579,143 +582,217 @@ vec4 canvasDetail(vec2 uv, int layer, int mode, inout vec3 col, inout float h){
   }
   return vec4(col, amt);
 }
-// Just past the frame the canvas continues as its own reflection (seamless at the edge), fading out.
-vec2 mirrorUV(vec2 uv){ vec2 m = uv; m = mix(m, -m, step(m, vec2(0.0))); m = mix(m, 2.0 - m, step(vec2(1.0), m)); return clamp(m, 0.001, 0.999); }
-vec3 mirrorPaint(vec2 uv, int layer){
-  vec2 m = mirrorUV(uv);
-  int top = topLayer(m);
-  if (top == layer) return texture(uPaint, m).rgb;
-  return fillAt(layer, m);
-}
-float mirrorW(vec2 uv, float reach){ float d = frameDist(uv); return d <= 0.0 ? 1.0 : exp(-d / reach) * smoothstep(reach * 5.0, reach * 2.0, d); }
-// The canvas extended around the painter: equiangular coordinates beyond the frame, reflected at every
-// edge (seamless), closing exactly at the back, and slowly warped with distance so it never reads as a mirror.
-uniform vec2 uExtAng;   // half-angles of the frame (horizontal, vertical) in the painter's camera
-uniform float uExtWarp;
-uniform vec2 uC0YawPitch;
-float triWave(float x){ return abs(x - 2.0 * floor(x * 0.5 + 0.5)); }
-// Level (world) azimuth/elevation relative to the painter's gaze, so the painted horizon stays level all round.
-vec2 extUVL(vec3 dWorld, vec2 persp, float front, out float far, float landShear, bool sky){
-  float az = atan(dWorld.x, -dWorld.z) - uC0YawPitch.x;
-  az = atan(sin(az), cos(az));
-  float el = asin(clamp(dWorld.y, -1.0, 1.0)) - uC0YawPitch.y;
-  float tile = (PI - uExtAng.x) / 2.5;
-  float u = 0.5 + az / (2.0 * uExtAng.x);
-  if (az > uExtAng.x) u = 1.0 + (az - uExtAng.x) / tile;
-  else if (az < -uExtAng.x) u = -(-uExtAng.x - az) / tile;
-  float v = 0.5 + el / (2.0 * uExtAng.y);
-  // shear: beyond a side edge the reflection slides vertically, beyond the top it slides sideways,
-  // so nothing mirrors symmetrically (continuous at the edge itself)
-  float ho = max(-u, u - 1.0);
-  float sideSgn = u > 1.0 ? 1.0 : -1.0;
-  if (ho > 0.0) v += landShear != 0.0 ? landShear * sideSgn * min(ho, 0.6) : 0.9 * min(ho, 0.8);
-  // the reflection is also stretched, so mirrored shapes never read as symmetric twins
-  if (u > 1.0) u = 1.0 + (u - 1.0) * 1.4;
-  else if (u < 0.0) u *= 1.4;
-  float vo = max(v - 1.0, 0.0);
-  u += 0.35 * vo;
-  vec2 ua = vec2(u, v);
-  float fd = max(max(-u, u - 1.0) * uExtAng.x / uExtAng.y, max(-v, v - 1.0));
-  far = fd;
-  float tp = front > 0.2 ? 1.0 - smoothstep(0.0, 0.3, fd) : 0.0;
-  vec2 uv = mix(ua, persp, tp);
-  // a smooth warp that grows with distance from the frame breaks every mirror symmetry
-  float wk = (smoothstep(0.05, 0.6, fd) * 0.45 + smoothstep(0.6, 2.2, fd) * 0.55) * uExtWarp;
-  vec3 q = dWorld * 1.6;
-  uv += wk * (vec2(fbm3(q + 3.1), fbm3(q + 7.7)) - 0.5) * vec2(1.1, 0.5);
-  // vertical reflections stay inside their own band (sky above, land below)
-  float vv = uv.y;
-  if (sky && vv > 1.0) vv = 1.0 - uBands.x * triWave((vv - 1.0) / uBands.x);
-  else if (!sky && vv < 0.0) vv = uBands.y * triWave(-vv / uBands.y);
-  else vv = triWave(vv);
-  return vec2(triWave(uv.x), vv);
-}
-vec2 extUV(vec3 d, vec2 p, float f, out float far){ return extUVL(d, p, f, far, 0.0, true); }
-uniform sampler2D uHalo;
-float extHalo(vec2 m){ return texture(uHalo, m).r; }
-uniform float uExOn;
-uniform vec4 uExRect;   // exemplar rectangle in canvas uv (GL, y up): u0, v0, u1, v1
-uniform vec2 uExTile;   // tile size in world units
-uniform float uExAxis;  // 0: floor (xz), 1: wall (along-wall, height)
-uniform sampler2D uExTex;
-uniform float uExOwn;   // 1: sample a dedicated (quilted) texture instead of a rectangle of the painting
-vec3 exSample(vec2 uv, float lod){ return uExOwn > 0.5 ? textureLod(uExTex, uv, lod).rgb : textureLod(uPaint, uv, lod).rgb; }
-vec2 exemplarUV(vec2 w){
-  vec2 q = w / uExTile;
-  q += (vec2(fbm2(w * 0.021 + 1.3), fbm2(w * 0.019 + 7.1)) - 0.5) * 1.4;
-  vec2 t = vec2(triWave(q.x), triWave(q.y));
-  return mix(uExRect.xy, uExRect.zw, t);
-}
-// Colour source for procedural strokes just outside the frame: continue the canvas edge.
-vec3 edgeContinue(vec3 procCol, vec2 uv){
-  if (uCanvasOn < 0.5) return procCol;
-  float d = frameDist(uv);
-  if (d <= 0.0 || d > 0.35) return procCol;
-  float w = exp(-d / 0.07) * 0.85;
-  return mix(procCol, paintBlur(uv, 4.0), w);
-}
 `;
 
-// The panorama: Vincent's canvas extended around his eye (equirectangular), for everything outside the frame.
-const GL_PANO = /* glsl */`
-uniform float uPanoOn;
-uniform sampler2D uPano;
-uniform sampler2D uPanoLab;
-uniform sampler2D uPanoFlow;
-uniform vec2 uPanoEl;
-uniform vec2 uPanoPx;
-uniform float uPanoFlowAmt;
-struct PanoS { vec2 uv; vec2 gx; vec2 gy; float el; };
-// Direction from the painter's eye -> panorama coordinates with seam-safe derivatives (call in uniform control flow)
-PanoS panoOf(vec3 d){
-  PanoS p;
-  float az = atan(d.x, -d.z);
-  p.el = degrees(asin(clamp(d.y, -1.0, 1.0)));
-  vec2 a = vec2(az / TAU + 0.5, (p.el - uPanoEl.x) / (uPanoEl.y - uPanoEl.x));
-  vec2 b = vec2(fract(a.x + 0.5), a.y);
-  vec2 gxa = dFdx(a), gya = dFdy(a), gxb = dFdx(b), gyb = dFdy(b);
-  bool useB = abs(gxa.x) + abs(gya.x) > abs(gxb.x) + abs(gyb.x);
-  p.uv = a; p.gx = useB ? gxb : gxa; p.gy = useB ? gyb : gya;
-  return p;
+// ---------------------------------------------------------------------------
+// Beyond the frame. Nothing was painted there, so the canvas is continued around
+// the painter from what he did paint, without mirroring anything:
+//   - low frequencies: each layer (sky, land) spreads outward from the frame edge
+//     through normalised mip filtering of a "plate" that holds only that layer;
+//   - brushwork: patches of his own strokes, taken from the same band of the canvas,
+//     blended on a triangle grid so their contrast survives (Heitz & Neyret 2018).
+//     They carry every scale the spreading colour has lost, and far from the frame
+//     their own local colours take over from it;
+//   - stars: copies of his painted stars scattered over the extended sky.
+// The painting cross-fades into this across an irregular band just inside the frame,
+// so its edge never shows as a line.
+// ---------------------------------------------------------------------------
+const GL_EXT = /* glsl */`
+uniform sampler2D uPlateSky; uniform sampler2D uPlateLand;  // (rgb * w, w) of one layer, mipmapped
+uniform sampler2D uGradSky; uniform sampler2D uGradLand;    // average colour of each row of that layer (v up), left and right halves
+uniform sampler2D uCand;    // brushwork patch centres: x = slot, y = band of the canvas (sky left half, sky right, land left, land right)
+uniform vec2 uCandN;        // slots per band, bands per half
+uniform vec2 uExtAng;       // half-angles of the frame (horizontal, vertical)
+uniform vec2 uC0YawPitch;
+uniform float uPatch;       // patch diameter in canvas heights
+uniform float uHF;          // strength of the borrowed brushwork
+uniform float uExtLodMax;   // coarsest scale (painting mip level) the borrowed brushwork carries
+uniform float uFarDev;      // how much of each patch's own colour carries far from the frame (0: the row's colour only)
+uniform sampler2D uHalo;
+uniform vec4 uStars[24]; uniform int uStarN;   // painted stars to copy: centre (uv), radius (canvas heights)
+uniform vec3 uStarCfg;      // cell size (radians), chance of a star per cell, lowest elevation (degrees)
+uniform sampler2D uHoriz; uniform float uHorizOn;  // elevation (degrees) of the far skyline all round the painter
+
+// Canvas coordinates continued past the frame (v up), and the signed distance to the frame in canvas heights.
+// Close to the frame they are the painter's own perspective; further out, level azimuth and elevation.
+vec2 extCoord(vec3 d, out float fd){
+  float front; vec2 persp = canvasUVDir(d, front);
+  float az = atan(d.x, -d.z) - uC0YawPitch.x;
+  az = atan(sin(az), cos(az));
+  float el = asin(clamp(d.y, -1.0, 1.0)) - uC0YawPitch.y;
+  vec2 ua = vec2(0.5 + az / (2.0 * uExtAng.x), 0.5 + el / (2.0 * uExtAng.y));
+  float fa = max(max(-ua.x, ua.x - 1.0) * uAspect, max(-ua.y, ua.y - 1.0));
+  vec2 uv = front > 0.05 ? mix(ua, persp, 1.0 - smoothstep(0.0, 0.3, fa)) : ua;
+  fd = frameDist(uv);
+  return uv;
 }
-bool panoCovers(PanoS p){ return uPanoOn > 0.5 && p.uv.y >= 0.0 && p.uv.y <= 1.0; }
-float panoLand(PanoS p){ return textureGrad(uPanoLab, p.uv, p.gx, p.gy).r; }
-vec3 panoAt(PanoS p){ return textureGrad(uPano, p.uv, p.gx, p.gy).rgb; }
-vec3 panoFlowAt(PanoS p){
-  vec4 F = texture(uPanoFlow, p.uv);
-  vec2 dir = vec2(F.x * 2.0 - 1.0, -(F.y * 2.0 - 1.0));
-  vec2 f = dir * F.z * uPanoFlowAmt / uPanoPx;
-  float T = uTime * uFlowRate;
+float horizAt(vec3 d){
+  if (uHorizOn < 0.5) return -90.0;
+  float t = fract((atan(d.x, -d.z) - uC0YawPitch.x) / TAU + 0.5);
+  return texture(uHoriz, vec2(t, 0.5)).r;
+}
+
+// ---- low frequencies
+vec4 plateAt(sampler2D P, vec2 q, float L){
+  return textureLod(P, q, L) + textureLod(P, q, L + 2.5) * 0.05 + textureLod(P, q, L + 5.0) * 0.003;
+}
+// Average colour of the layer's row v on one side of the canvas (side 0 left .. 1 right, blended between).
+vec3 rowColour(int layer, float v, float side){
+  vec2 q = vec2(0.25 + 0.5 * side, clamp(v, 0.0, 1.0));
+  return layer == 0 ? texture(uGradSky, q).rgb : texture(uGradLand, q).rgb;
+}
+// which side of the painter's gaze a direction is on, soft so both sides meet behind him
+float sideOf(vec3 d){ return smoothstep(-0.35, 0.35, sin(atan(d.x, -d.z) - uC0YawPitch.x)); }
+// Blur of the spreading colour at a distance o (canvas heights) past the frame, as a mip level of the
+// painting: it widens as fast as the distance grows, so the edge never streaks outward.
+float extLod(float o){ return clamp(log2(max(o * uPaintPx.y * 0.7, 1.0)), 3.6, 7.5); }
+float extLodM(float o){ return min(extLod(o), uExtLodMax); }
+vec3 extLF(int layer, vec2 uv, float fd){
+  // read a little inside the frame (the outermost pixels of the scan are paler than the paint) and further
+  // in as the blur widens
+  float o = max(fd, 0.0);
+  vec2 inset = vec2(1.0 / uAspect, 1.0) * min(0.015 + o * 0.5, 0.3);
+  vec2 q = clamp(uv, inset, 1.0 - inset);
+  float L = extLod(o) - log2(uPaintPx.x / 512.0);
+  vec4 a = layer == 0 ? plateAt(uPlateSky, q, L) : plateAt(uPlateLand, q, L);
+  vec3 row = rowColour(layer, q.y, step(0.5, q.x));
+  return a.a > 1e-5 ? mix(row, a.rgb / a.a, smoothstep(0.0005, 0.01, a.a)) : row;
+}
+
+// ---- brushwork: a triangle grid whose corners each lend a patch of the painting
+const mat2 SKEW = mat2(1.0, 0.0, -0.57735027, 1.15470054);
+vec3 triBary(vec2 p, out ivec2 i1, out ivec2 i2, out ivec2 i3){
+  vec2 s = SKEW * (p * 3.4641016);
+  vec2 b = floor(s); vec2 f = s - b;
+  ivec2 B = ivec2(b);
+  float z = 1.0 - f.x - f.y;
+  if (z > 0.0) { i1 = B; i2 = B + ivec2(0, 1); i3 = B + ivec2(1, 0); return vec3(z, f.y, f.x); }
+  i1 = B + ivec2(1, 1); i2 = B + ivec2(1, 0); i3 = B + ivec2(0, 1);
+  return vec3(-z, 1.0 - f.y, 1.0 - f.x);
+}
+vec2 triVertex(ivec2 i){ return vec2(float(i.x) + 0.5 * float(i.y), 0.8660254 * float(i.y)) / 3.4641016; }
+
+// A grid point: p in grid units, its screen derivatives, and M taking grid offsets to source uv offsets.
+struct Grid { vec2 p; vec2 gx; vec2 gy; mat2 M; float K; };
+// Directions: stereographic from the nadir, conformal and seamless all the way round and overhead.
+// Patches are turned so that up in the painting stays up in the world. (Call in uniform control flow.)
+Grid dirGrid(vec3 d){
+  Grid g;
+  float y = max(d.y, -0.7);
+  g.K = 0.57735 / (uPatch * 2.0 * uExtAng.y);
+  g.p = d.xz / (1.0 + y) * g.K;
+  g.gx = dFdx(g.p); g.gy = dFdy(g.p);
+  float al = atan(d.x, -d.z);
+  vec2 R = vec2(cos(al), sin(al)), U = vec2(-sin(al), cos(al));
+  float sc = (1.0 + y) * uPatch / 0.57735;
+  g.M = mat2(R.x * sc / uAspect, U.x * sc, R.y * sc / uAspect, U.y * sc);
+  return g;
+}
+// Where a grid point lies around the painter: the canvas row its elevation belongs to (x), and which side
+// of his gaze it is on (y: 0 left, 1 right). Patches come from that band and that half of the canvas.
+vec2 placeOfGridPoint(vec2 vp, float K){
+  vec2 s = vp / K; float q = dot(s, s);
+  vec3 d = vec3(2.0 * s.x, 1.0 - q, 2.0 * s.y) / (1.0 + q);
+  float az = atan(d.x, -d.z) - uC0YawPitch.x;
+  return vec2(0.5 + (asin(clamp(d.y, -1.0, 1.0)) - uC0YawPitch.y) / (2.0 * uExtAng.y), sin(az) < 0.0 ? 0.0 : 1.0);
+}
+vec2 candAt(ivec2 vid, vec2 place, int layer){
+  vec4 h = hash42(vec2(vid) * 0.7071 + float(layer) * 13.1 + 0.37);
+  float n = uCandN.y;
+  int row = int(clamp(floor(clamp(place.x, 0.0, 0.999) * n + (h.y - 0.5) * 0.7), 0.0, n - 1.0)) + (layer * 2 + int(place.y)) * int(n);
+  return texelFetch(uCand, ivec2(int(h.x * uCandN.x), row), 0).xy;
+}
+vec3 sourcePatch(vec2 src, vec2 gx, vec2 gy, bool flow){
+  if (!flow) return textureGrad(uPaint, src, gx, gy).rgb;
+  vec4 F = texture(uFlow, src);
+  vec2 f = vec2(F.x * 2.0 - 1.0, -(F.y * 2.0 - 1.0)) * F.z * uFlowAmt / uPaintPx;
+  float T = uTime * uFlowRate + vnoise(src * vec2(7.0, 5.6)) * 1.7;
   float p0 = fract(T), p1 = fract(T + 0.5);
-  vec3 c0 = textureGrad(uPano, p.uv - f * (p0 - 0.5), p.gx, p.gy).rgb;
-  vec3 c1 = textureGrad(uPano, p.uv - f * (p1 - 0.5), p.gx, p.gy).rgb;
+  vec3 c0 = textureGrad(uPaint, src - f * (p0 - 0.5), gx, gy).rgb;
+  vec3 c1 = textureGrad(uPaint, src - f * (p1 - 0.5), gx, gy).rgb;
   return mix(c0, c1, abs(2.0 * p0 - 1.0));
 }
-float panoRelief(PanoS p){ return 0.5 + (lum(textureGrad(uPano, p.uv, p.gx, p.gy).rgb) - lum(textureLod(uPano, p.uv, 2.5).rgb)) * uRelief; }
-// crisp strokes in the panorama's colours when it is magnified
-void panoDetail(PanoS p, bool sky, inout vec3 col, inout float h){
-  vec2 ppx = p.uv * uPanoPx;
-  float tpp = length(vec2(length(p.gx * uPanoPx), length(p.gy * uPanoPx)));
-  float mag = 1.0 / max(tpp, 1e-4);
-  float amt = smoothstep(1.1, 2.2, mag) * uDetail;
-  if (amt <= 0.001) return;
-  vec2 d = vec2(1.0, 0.0);
-  if (sky) { vec4 F = texture(uPanoFlow, p.uv); d = normalize(vec2(F.x * 2.0 - 1.0, -(F.y * 2.0 - 1.0)) + vec2(1e-4, 0.0)); }
-  float S = clamp(18.0 / mag, 1.6, 6.0);
-  vec2 q = ppx / S;
-  Stroke s1 = noStroke(), s2 = noStroke();
-  strokeLayer(q, 1.0, vec2(0.0), d, 0.86, 0.3, tpp / S, sky ? 11.0 : 12.0, 0.0, s1, s2);
-  float lod = log2(max(S * 0.6, 1.0));
-  if (s2.pri >= 0.0) {
-    vec3 sc = textureLod(uPano, s2.c * S / uPanoPx, lod).rgb; float st = strokeStreak(s2);
-    sc *= 0.9 + 0.2 * st + (s2.r.z - 0.5) * 0.14;
-    col = mix(col, sc, s2.m * amt); h = mix(h, strokeHeight(s2, st), s2.m * amt);
-  }
-  if (s1.pri >= 0.0) {
-    vec3 sc = textureLod(uPano, s1.c * S / uPanoPx, lod).rgb; float st = strokeStreak(s1);
-    sc *= 0.9 + 0.2 * st + (s1.r.z - 0.5) * 0.14;
-    col = mix(col, sc, s1.m * amt); h = mix(h, strokeHeight(s1, st), s1.m * amt);
-  }
+// One patch, centred on cen: its brushwork above the mip level lodM (painting minus the layer's own mean
+// there, so stars and objects nearby don't bias it), weighted by how much of it belongs to the layer.
+// How the patch's colour differs from the average of its own row is accumulated too, measured once over a
+// wide area around its centre: far from the frame that difference, laid over the average of the row being
+// filled, is the local colour.
+vec3 patchDetail(vec2 cen, vec2 off, Grid g, int layer, bool flow, float bw, float lodM, inout vec4 mean, inout float w2){
+  vec2 src = cen + off;
+  vec2 gx = g.M * g.gx, gy = g.M * g.gy;
+  vec4 pb = layer == 0 ? textureLod(uPlateSky, cen, 4.5) : textureLod(uPlateLand, cen, 4.5);
+  mean += vec4((pb.rgb / max(pb.a, 1e-4) - rowColour(layer, cen.y, step(0.5, cen.x))) * bw * bw * uFarDev, bw * bw);
+  float valid = layer == 0 ? textureLod(uPlateSky, src, 2.0).a : textureLod(uPlateLand, src, 2.0).a;
+  float w = bw * bw * smoothstep(0.3, 0.9, valid);
+  w2 += w * w;
+  if (w < 1e-4) return vec3(0.0);
+  vec2 fx = gx * uPaintPx, fy = gy * uPaintPx;
+  float L = max(0.5 * log2(max(max(dot(fx, fx), dot(fy, fy)), 1.0)) + 0.5, lodM) - log2(uPaintPx.x / 512.0);
+  vec4 pm = layer == 0 ? textureLod(uPlateSky, src, L) : textureLod(uPlateLand, src, L);
+  return w * (sourcePatch(src, gx, gy, flow) - pm.rgb / max(pm.a, 1e-4));
+}
+vec3 extHF(Grid g, int layer, bool flow, float lodM, out vec4 mean){
+  ivec2 i1, i2, i3; vec3 b = triBary(g.p, i1, i2, i3);
+  vec2 v1 = triVertex(i1), v2 = triVertex(i2), v3 = triVertex(i3);
+  float w2 = 0.0; mean = vec4(0.0);
+  vec3 acc = patchDetail(candAt(i1, placeOfGridPoint(v1, g.K), layer), g.M * (g.p - v1), g, layer, flow, b.x, lodM, mean, w2)
+           + patchDetail(candAt(i2, placeOfGridPoint(v2, g.K), layer), g.M * (g.p - v2), g, layer, flow, b.y, lodM, mean, w2)
+           + patchDetail(candAt(i3, placeOfGridPoint(v3, g.K), layer), g.M * (g.p - v3), g, layer, flow, b.z, lodM, mean, w2);
+  return w2 > 1e-6 ? acc / sqrt(w2) : vec3(0.0);
+}
+// spreading colour near the frame; further out, the row's own colour with the patches' local differences
+vec3 extBase(vec3 lf, vec4 mean, vec3 row, float fd, float reach){
+  vec3 far = row + (mean.a > 1e-4 ? mean.rgb / mean.a : vec3(0.0));
+  return mix(lf, far, smoothstep(0.03 * reach, 0.5 * reach, fd));
+}
+
+// ---- stars: one of his stars, copied, in some cells of a coarse grid over the sky
+vec3 extStars(vec3 d, vec3 col, out float lift){
+  lift = 0.0;
+  if (uStarN <= 0) return col;
+  float y = max(d.y, -0.7);
+  vec2 s = d.xz / (1.0 + y);
+  vec2 cell = floor(s / uStarCfg.x);
+  vec4 h = hash42(cell + 71.3);
+  if (h.w > uStarCfg.y) return col;
+  vec2 cs = (cell + 0.3 + 0.4 * h.xy) * uStarCfg.x;
+  float q = dot(cs, cs);
+  vec3 dc = vec3(2.0 * cs.x, 1.0 - q, 2.0 * cs.y) / (1.0 + q);
+  float elc = degrees(asin(clamp(dc.y, -1.0, 1.0)));
+  if (elc < max(uStarCfg.z, horizAt(dc) + 4.0)) return col;
+  float fdc; vec2 uvc = extCoord(dc, fdc);
+  if (fdc < 0.06) return col;   // never crowd his own stars
+  int k = int(min(h.z * float(uStarN), float(uStarN) - 0.5));
+  vec4 S = uStars[k];
+  float scale = 0.85 + 0.3 * fract(h.z * 17.0);
+  float al = atan(d.x, -d.z);
+  vec2 R = vec2(cos(al), sin(al)), U = vec2(-sin(al), cos(al));
+  vec2 o = (s - cs) * (1.0 + y) / (2.0 * uExtAng.y) / scale;   // canvas heights from the copied star's centre
+  vec2 off = vec2(dot(o, R) / uAspect, dot(o, U));
+  float rr = length(vec2(off.x * uAspect, off.y)) / S.z;
+  if (rr > 1.3) return col;
+  vec2 src = S.xy + off;
+  float m = smoothstep(0.08, 0.5, texture(uHalo, src).r) * (1.0 - smoothstep(0.35, 1.0, rr)) * smoothstep(0.0, 0.1, fdc);
+  m *= smoothstep(uStarCfg.z, uStarCfg.z + 6.0, elc);
+  lift = m;
+  return mix(col, paintFlow(src), m);
+}
+
+// ---- the extended canvas in a direction from the painter
+vec3 extSky(vec3 d, Grid g, vec2 uv, float fd, out float h){
+  vec4 mean; vec3 hf = extHF(g, 0, true, extLodM(max(fd, 0.0)), mean);
+  vec3 base = extBase(extLF(0, uv, fd), mean, rowColour(0, uv.y, sideOf(d)), fd, 1.0);
+  vec3 c = base + hf * uHF;
+  float lift; c = extStars(d, c, lift);
+  h = 0.5 + (lum(c) - lum(base)) * uRelief;
+  return c;
+}
+vec3 extLand(vec3 d, Grid g, vec2 uv, float fd, out float h){
+  vec4 mean; vec3 hf = extHF(g, 1, false, extLodM(max(fd, 0.0)), mean);
+  vec3 base = extBase(extLF(1, uv, fd), mean, rowColour(1, uv.y, sideOf(d)), fd, 1.0);
+  vec3 c = base + hf * uHF;
+  h = 0.5 + (lum(c) - lum(base)) * uRelief;
+  return c;
 }
 `;
 
@@ -743,7 +820,6 @@ class Env {
       uBeamOn: { value: 0 },
       uWinMin: { value: V3() },
       uWinMax: { value: V3() },
-      uCellPx: { value: 18 },
     };
   }
   addLight(pos, radius, color = '#ffe2a8', intensity = 1) {
@@ -813,7 +889,8 @@ vec3 shade(vec3 P, vec3 N, int slot, vec4 r){
   vec3 col;
   if (gSide > 0.5) {
     float cd; vec2 cu = canvasUV(P, cd);
-    vec3 base = paintBlur(cu, 2.2);
+    float fo = frameDist(cu);
+    vec3 base = paintBlur(cu, fo > 0.0 ? 4.0 + fo * 10.0 : 6.0);
     float lit = 0.78 + 0.32 * sat(dot(N, uKeyDir) * 0.5 + 0.5);
     return base * lit * (0.88 + 0.24 * r.z);
   }
@@ -828,16 +905,17 @@ vec3 shade(vec3 P, vec3 N, int slot, vec4 r){
     float wj = w + (r.x - 0.5) * 0.3;
     col = mix(col, warmRamp(wj) * tint, smoothstep(0.1, 0.55, wj));
   }
-  col = mix(col, uFogCol, smoothstep(uFog.x, uFog.y, dist) * (cfg.x > 0.5 ? 0.4 : 1.0));
-  float cd; vec2 cu = canvasUV(P, cd);
-  return cd > 0.0 ? edgeContinue(col, cu) : col;
+  return mix(col, uFogCol, smoothstep(uFog.x, uFog.y, dist) * (cfg.x > 0.5 ? 0.4 : 1.0));
 }
 void main(){
   vec3 N = normalize(vNrm);
   if (!gl_FrontFacing) N = -N;
+  float mask = 0.0;
   if (uCanvasOn > 0.5) {
     float cdep; vec2 cuv = canvasUV(vPos, cdep);
-    if (cdep > 0.0 && inFrame(cuv)) {
+    float fd = frameDist(cuv);
+    mask = cdep > 0.0 ? frameMask(fd) : 0.0;
+    if (cdep > 0.0 && fd < 0.0) {
       int me = int(uLayer + 0.5);
       int top = topLayer(cuv);
       if (top < me) discard;
@@ -845,19 +923,26 @@ void main(){
       if (top == me && face) {
         vec3 c = paintAt(cuv); float hh = paintRelief(cuv);
         canvasDetail(cuv, me, 0, c, hh);
+        // near the frame edge the painted surface hands over to its own colours, as beyond the frame
+        float wP = paintWeight(cuv, fd);
+        if (wP < 0.999) {
+          float lit = 0.78 + 0.32 * sat(dot(N, uKeyDir) * 0.5 + 0.5);
+          c = mix(paintBlur(cuv, 2.2) * lit, c, wP);
+        }
         outColor = vec4(c, 1.0);
-        outInfo = vec4(hh, fract(uObjId + vId), 0.0, 1.0);
+        outInfo = vec4(hh, fract(uObjId + vId), 0.0, mask);
         return;
       }
       if (top > me) {
         vec3 c = fillAt(me, cuv); float hh = 0.0;
         canvasDetail(cuv, me, 1, c, hh);
         outColor = vec4(c, 1.0);
-        outInfo = vec4(hh, fract(uObjId + vId), uInkW, 0.0);
+        outInfo = vec4(hh, fract(uObjId + vId), 0.0, mask);
         return;
       }
-      gSide = 1.0;   // a face turned away from the painter: brush it in the painted colours
     }
+    // a face turned away from the painter, or outside his frame: brush it in the painted colours
+    gSide = 1.0;
   }
   int slot = int(vPart + 0.5);
   vec4 cfg = uPartCfg[slot];
@@ -896,13 +981,11 @@ void main(){
     h = mix(h, strokeHeight(s1, st), s1.m);
   }
   outColor = vec4(col, 1.0);
-  outInfo = vec4(h * cfg.w, fract(uObjId + vId), uInkW, 0.0);
+  outInfo = vec4(gSide > 0.5 ? 0.5 + (h - 0.5) * 0.25 : h * cfg.w, fract(uObjId + vId), uCanvasOn > 0.5 ? 0.0 : uInkW, mask);
 }`;
 
 const CANVAS_OFF = { uCanvasOn: { value: 0 } };
 function canvasUniforms(c) { return c ? c.uniforms : CANVAS_OFF; }
-const PANO_OFF = { uPanoOn: { value: 0 } };
-function panoUniforms(c) { return c && c.pano ? c.pano : PANO_OFF; }
 function paintMaterial(env, o) {
   const ramps = [];
   for (let s = 0; s < 4; s++) {
@@ -1100,7 +1183,7 @@ function poolMaterial(env, center, radius) {
 
 // ==== 04-ground.js ====
 // ---------------------------------------------------------------------------
-// Ground: large painted surfaces with stroke level-of-detail, plus brushed grass.
+// Ground: large surfaces carrying the canvas, and its continuation beyond the frame.
 // ---------------------------------------------------------------------------
 
 const GROUND_VS = /* glsl */`
@@ -1116,389 +1199,178 @@ ${GL_COMMON}
 ${GL_STROKE}
 ${GL_ENV}
 ${GL_CANVAS}
-${GL_PANO}
+${GL_EXT}
 ${GL_OUT}
 in vec3 vPos; in vec3 vNrm;
-uniform vec3 uRB[6]; uniform vec3 uRA[6]; uniform vec3 uRP[6]; uniform vec3 uRF[6];
-uniform sampler2D uRegion; uniform vec4 uRegionRect; uniform float uHasRegion;
-uniform vec4 uFieldE;
-uniform float uCell0; uniform float uLenT; uniform float uWidT; uniform float uDirMode; uniform float uDirAng;
-uniform float uObjId; uniform float uAccentAmt; uniform vec3 uAccent0; uniform vec3 uAccent1;
-uniform vec3 uMid; uniform float uMidAmt; uniform float uInkW; uniform float uDrift; uniform float uLayer; uniform float uLandShear; uniform float uIsWater;
+uniform float uObjId; uniform float uLayer; uniform float uIsWater; uniform float uMaskUp;
+uniform float uExOn; uniform float uExOwn; uniform float uExAxis; uniform vec4 uExRect; uniform vec2 uExScale; uniform float uExPatch;
+uniform sampler2D uExTex; uniform vec3 uExMean; uniform float uExRowH;
 
-#ifdef WATER
-uniform vec4 uLamps[32]; uniform int uLampN; uniform float uStreakW; uniform float uStreakLen;
-vec3 groundColor(vec3 Pc, vec3 N, vec4 r, float dist){
-  vec3 toP = Pc - cameraPosition;
-  vec3 V = normalize(toP);
-  float graze = 1.0 - sat(-V.y * 3.2);
-  float v = mix(uAmb, uAmb + uKey, graze * graze) + (r.z - 0.5) * 0.26;
-  vec3 col = RAMP6(uRB, v);
-  if (r.w < uAccentAmt) col = mix(col, r.y < 0.5 ? uAccent0 : uAccent1, 0.7);
-  float azP = atan(toP.x, -toP.z);
-  float elP = atan(toP.y, length(toP.xz));
-  float I = 0.0;
-  for (int i = 0; i < 32; i++){
-    if (i >= uLampN) break;
-    vec3 Lm = vec3(uLamps[i].x, -uLamps[i].y, uLamps[i].z) - cameraPosition;
-    float along = atan(Lm.y, length(Lm.xz)) - elP;
-    if (along < -0.01) continue;
-    float daz = azP - atan(Lm.x, -Lm.z);
-    float w = uStreakW + 0.05 * max(along, 0.0);
-    I += exp(-daz * daz / (w * w)) * smoothstep(-0.006, 0.004, along) * exp(-max(along, 0.0) * uStreakLen) * uLamps[i].w;
-  }
-  I *= 0.55 + 0.9 * vnoise(vec2(Pc.x * 0.4 + uTime * 0.5, Pc.z * 1.2 - uTime * 0.35));
-  float Ij = I + (r.x - 0.5) * 0.35;
-  if (Ij > 0.3) col = warmRamp(0.35 + Ij * 0.5 + (r.y - 0.5) * 0.25);
-  else if (Ij > 0.16 && r.y > 0.5) col = mix(col, uMid, 0.8);
-  col = mix(col, uFogCol, smoothstep(uFog.x, uFog.y, dist));
-  float cd; vec2 cu = canvasUV(Pc, cd);
-  return cd > 0.0 ? edgeContinue(col, cu) : col;
+// Near the painter the borrowed brushwork is laid on the ground itself, on a triangle grid in metres,
+// from an exemplar: a stretch of the painting, or a texture made from his own wall and floor paint.
+Grid worldGrid(vec2 P){
+  Grid g;
+  g.K = 0.57735 / uExPatch;
+  g.p = P * g.K;
+  g.gx = dFdx(g.p); g.gy = dFdy(g.p);
+  g.M = mat2(uExScale.x / g.K, 0.0, 0.0, uExScale.y / g.K);
+  return g;
 }
-#else
-vec3 groundColor(vec3 Pc, vec3 N, vec4 r, float dist){
-  if (uExOn > 0.5) {
-    vec3 ec = exSample(exemplarUV(uExAxis > 0.5 ? vec2(Pc.x + Pc.z, Pc.y) : Pc.xz), 1.2);
-    ec *= 0.9 + 0.2 * r.z;
-    float cd; vec2 cu = canvasUV(Pc, cd);
-    return cd > 0.0 ? edgeContinue(ec, cu) : ec;
+vec3 worldPatch(ivec2 vid, Grid g, float bw, inout vec4 mean, inout float w2){
+  vec4 hs = hash42(vec2(vid) * 0.7071 + 5.3);
+  vec2 r = vec2(uExPatch * 0.5) * uExScale;
+  vec2 lo = uExRect.xy + r, hi = max(uExRect.zw - r, lo);
+  vec2 cen = mix(lo, hi, hs.xy);
+  // on a wall, the patch comes from the height of the facade it will be laid at (windows stay at window height)
+  if (uExRowH > 0.0) cen.y = mix(lo.y, hi.y, clamp(triVertex(vid).y / g.K / uExRowH + (hs.z - 0.5) * 0.12, 0.0, 1.0));
+  vec2 src = cen + g.M * (g.p - triVertex(vid));
+  vec2 gx = g.M * g.gx, gy = g.M * g.gy;
+  float w = bw * bw;
+  vec3 c, m;
+  if (uExOwn > 0.5) {
+    c = textureGrad(uExTex, src, gx, gy).rgb;
+    vec2 fx = gx * 1024.0, fy = gy * 1024.0;
+    m = textureLod(uExTex, src, max(0.5 * log2(max(max(dot(fx, fx), dot(fy, fy)), 1.0)) + 0.5, 5.5)).rgb;
+    mean += vec4((textureLod(uExTex, cen, 6.5).rgb - uExMean) * w, w);
+  } else {
+    c = textureGrad(uPaint, src, gx, gy).rgb;
+    vec2 fx = gx * uPaintPx, fy = gy * uPaintPx;
+    m = textureLod(uPaint, src, max(0.5 * log2(max(max(dot(fx, fx), dot(fy, fy)), 1.0)) + 0.5, 6.5)).rgb;
+    vec4 pc = textureLod(uPlateLand, cen, 4.0);
+    mean += vec4((pc.rgb / max(pc.a, 1e-4) - uExMean) * w, w);
+    w *= smoothstep(0.3, 0.9, textureLod(uPlateLand, src, 2.0).a);
   }
-  float diff = sat((dot(N, uKeyDir) + uWrap) / (1.0 + uWrap));
-  float v = uAmb + uKey * diff * beamMask(Pc) + uFill * sat(dot(N, uFillDir) * 0.5 + 0.5) + (r.z - 0.5) * 0.26;
-  vec4 reg = uHasRegion > 0.5 ? texture(uRegion, (Pc.xz - uRegionRect.xy) / uRegionRect.z) : vec4(0.0);
-  vec3 col = RAMP6(uRB, v);
-  if (uFieldE.z > 0.0) {
-    vec2 fe = (Pc.xz - uFieldE.xy) / uFieldE.zw;
-    float le = length(fe);
-    float fm = smoothstep(1.0, 0.82, le) * smoothstep(0.2, 0.34, le);
-    vec2 fr = rot2(Pc.xz, 0.35) / vec2(46.0, 30.0);
-    vec2 fc = floor(fr); float pv = hash12(fc + 3.0);
-    vec2 ff = fract(fr);
-    float edge = min(min(ff.x, 1.0 - ff.x) * 46.0, min(ff.y, 1.0 - ff.y) * 30.0);
-    fm *= smoothstep(0.8, 2.4, edge);
-    if (r.y < fm) col = pv < 0.38 ? RAMP6(uRF, v + 0.05) : (pv < 0.7 ? RAMP6(uRA, v - 0.12) : RAMP6(uRB, v + 0.14));
-  }
-  if (r.y < reg.b) col = RAMP6(uRA, v);
-  if (r.x < reg.a) col = RAMP6(uRP, v);
-  if (r.w < uAccentAmt) col = mix(col, r.y < 0.5 ? uAccent0 : uAccent1, 0.7);
-  vec3 tint; float w = pointLights(Pc, N, tint);
-  float wj = w + (r.x - 0.5) * 0.3;
-  if (uMidAmt > 0.0 && wj > 0.05 && wj < 0.42 && r.y > 1.0 - uMidAmt) col = mix(col, uMid, 0.85);
-  col = mix(col, warmRamp(wj) * tint, smoothstep(0.12, 0.58, wj));
-  col = mix(col, uFogCol, smoothstep(uFog.x, uFog.y, dist));
-  float cd; vec2 cu = canvasUV(Pc, cd);
-  return cd > 0.0 ? edgeContinue(col, cu) : col;
+  w2 += w * w;
+  return w * (c - m);
 }
-#endif
+vec3 worldHF(Grid g, out vec4 mean){
+  ivec2 i1, i2, i3; vec3 b = triBary(g.p, i1, i2, i3);
+  float w2 = 0.0; mean = vec4(0.0);
+  vec3 acc = worldPatch(i1, g, b.x, mean, w2) + worldPatch(i2, g, b.y, mean, w2) + worldPatch(i3, g, b.z, mean, w2);
+  return w2 > 1e-6 ? acc / sqrt(w2) : vec3(0.0);
+}
 
-vec3 gPC = vec3(0.0); float gPH = 0.0; float gPW = 0.0;
-vec3 gMC = vec3(0.0); float gMW = 0.0;
 void main(){
   vec3 N = normalize(vNrm);
   vec3 toP = vPos - uC0Pos;
   float distC0 = length(toP);
-  PanoS pano = panoOf(toP / max(distC0, 1e-4));
-  if (uCanvasOn > 0.5) {
-    float cdep; vec2 cuv = canvasUV(vPos, cdep);
-    if (uIsWater > 0.5 && cdep > 0.0) {
-      // reflections follow the viewer: the column comes from the current view direction,
-      // the distance along the water from the painter's projection (exact from Vincent's spot)
-      float fr; vec2 du = canvasUVDir(normalize(vPos - cameraPosition), fr);
-      if (fr > 0.05) cuv.x = du.x;
+  vec3 dC0 = toP / max(distC0, 1e-4);
+  // On water the reflections follow the viewer: columns of the canvas come from the view direction, rows from
+  // the painter's. The continuation past the frame does the same. (Derivatives are taken here, in uniform
+  // control flow.)
+  vec3 dV = normalize(vPos - cameraPosition);
+  Grid gd = dirGrid(uIsWater > 0.5 ? dV : dC0);
+  Grid gw = worldGrid(uExAxis > 0.5 ? vec2(vPos.x + vPos.z, vPos.y) : vec2(vPos.x, -vPos.z));
+  float fd; vec2 uv = extCoord(dC0, fd);
+  if (uIsWater > 0.5) { float fv; uv.x = extCoord(dV, fv).x; fd = frameDist(uv); }
+  float cdep; vec2 cuv = canvasUV(vPos, cdep);
+  if (uIsWater > 0.5 && cdep > 0.0) {
+    // reflections follow the viewer: the column comes from the current view direction,
+    // the distance along the water from the painter's projection (exact from Vincent's spot)
+    float fr; vec2 du = canvasUVDir(dV, fr);
+    if (fr > 0.05) cuv.x = du.x;
+  }
+  vec3 c = vec3(0.0); float h = 0.5; float wP = 0.0;
+  if (cdep > 0.0 && inFrame(cuv)) {
+    int me = int(uLayer + 0.5);
+    int top = topLayer(cuv);
+    if (top < me) discard;
+    bool face = dot(N, normalize(uC0Pos - vPos)) > 0.0;
+    bool hiddenOk = top == me || fillValid(me, cuv);
+    if (!hiddenOk && distC0 > uDiscardFar) discard;
+    if (hiddenOk) {
+      float wq = paintWeight(cuv, frameDist(cuv));
+      if (top == me && face) { c = paintAt(cuv); h = paintRelief(cuv); canvasDetail(cuv, me, 0, c, h); wP = wq; }
+      else if (top > me && uExOwn > 0.5) { wP = 0.0; }   // behind the furniture: his wall and floor paint
+      else if (top > me) { c = fillAt(me, cuv); canvasDetail(cuv, me, 1, c, h); wP = wq; }
+      else { c = paintBlur(cuv, 3.0); canvasDetail(cuv, me, 2, c, h); wP = wq; }
     }
-    if (cdep > 0.0 && inFrame(cuv)) {
-      int me = int(uLayer + 0.5);
-      int top = topLayer(cuv);
-      if (top < me) discard;
-      bool face = dot(N, normalize(uC0Pos - vPos)) > 0.0;
-      bool hiddenOk = top == me || fillValid(me, cuv);
-      if (!hiddenOk && distC0 > uDiscardFar) discard;
-      if (hiddenOk) {
-        vec3 c; float hh = 0.0; float painted = 0.0;
-        if (top == me && face) { c = paintAt(cuv); hh = paintRelief(cuv); painted = 1.0; canvasDetail(cuv, me, 0, c, hh); }
-        else if (top > me && uExOwn > 0.5) {
-          vec2 eu = exemplarUV(uExAxis > 0.5 ? vec2(vPos.x + vPos.z, vPos.y) : vPos.xz);
-          c = exSample(eu, 0.0); hh = 0.5 + (lum(c) - lum(exSample(eu, 2.5))) * uRelief;
-        }
-        else if (top > me) { c = fillAt(me, cuv); canvasDetail(cuv, me, 1, c, hh); }
-        else { c = paintBlur(cuv, 3.0); canvasDetail(cuv, me, 2, c, hh); }
-        outColor = vec4(c, 1.0);
-        outInfo = vec4(hh, uObjId, painted > 0.5 ? 0.0 : uInkW, painted);
-        return;
-      }
-    }
-    if (distC0 > uExtNear.x) {
-      float far; vec2 m = extUVL(toP / distC0, cuv, cdep, far, uLandShear, false);
-      int me = int(uLayer + 0.5);
-      int topm = topLayer(m);
-      bool okm = topm == me || (topm > me && fillValid(me, m));
-      if (!okm && distC0 > uDiscardFar) discard;
-      gMW = okm ? smoothstep(uExtNear.x, uExtNear.y, distC0) : 0.0;
-      gMC = topm == me ? texture(uPaint, m).rgb : fillAt(me, m);
-      if (gMW > 0.985) {
-        outColor = vec4(gMC, 1.0);
-        outInfo = vec4(paintRelief(m), uObjId, 0.0, 0.6);
-        return;
-      }
-    }
-    if (panoCovers(pano) && distC0 > 6.0) {
-      float isLand = panoLand(pano);
-      if (isLand < 0.5 && distC0 > 250.0) discard;
-      gPC = panoAt(pano); gPH = panoRelief(pano);
-      panoDetail(pano, false, gPC, gPH);
-      gPW = smoothstep(6.0, 14.0, distC0);
-      if (gPW > 0.999) {
-        outColor = vec4(gPC, 1.0);
-        outInfo = vec4(gPH, uObjId, 0.0, 0.6);
-        return;
-      }
-    }
+  } else if (uMaskUp > 0.5 && cdep > 0.0 && cuv.y > 1.0 && cuv.x > 0.0 && cuv.x < 1.0) {
+    // above the frame, the painted gaps between the buildings stay open to the sky
+    if (topLayer(vec2(cuv.x, 0.995)) < int(uLayer + 0.5)) discard;
   }
-  if (uExOn > 0.5) {
-    vec2 eu = exemplarUV(uExAxis > 0.5 ? vec2(vPos.x + vPos.z, vPos.y) : vPos.xz);
-    vec3 ec = exSample(eu, 0.0);
-    float eh = 0.5 + (lum(ec) - lum(exSample(eu, 2.5))) * uRelief;
-    float cd2; vec2 cu2 = canvasUV(vPos, cd2);
-    if (cd2 > 0.0) ec = edgeContinue(ec, cu2);
-    ec = mix(ec, gMC, gMW); eh = mix(eh, 0.5, gMW * 0.5);
-    outColor = vec4(ec, 1.0);
-    outInfo = vec4(eh, uObjId, 0.0, 0.6);
-    return;
+  if (wP < 0.999) {
+    // near the painter the brushwork lies on the ground itself, further away it comes from his viewpoint
+    vec3 lf = extLF(1, uv, fd);
+    vec3 row = rowColour(1, uv.y, sideOf(uIsWater > 0.5 ? dV : dC0));
+    float wd = uExOn > 0.5 ? smoothstep(uExtNear.x, uExtNear.y, distC0) : 1.0;
+    vec3 hf = vec3(0.0), base = vec3(0.0);
+    // his own wall and floor paint takes over from the frame's edge colours quickly (the edge is cluttered)
+    if (wd < 0.999) { vec4 mw; hf += (1.0 - wd) * worldHF(gw, mw); base += (1.0 - wd) * extBase(lf, mw, uExMean, fd, uExOwn > 0.5 ? 0.3 : 1.0); }
+    if (wd > 0.001) { vec4 md; hf += wd * extHF(gd, 1, false, extLodM(max(fd, 0.0)), md); base += wd * extBase(lf, md, row, fd, 1.0); }
+    vec3 e = base + hf * uHF;
+    float he = 0.5 + (lum(e) - lum(base)) * uRelief;
+    c = mix(e, c, wP); h = mix(he, h, wP);
   }
-  vec2 P = vPos.xz;
-  float dist = length(vPos - cameraPosition);
-  vec2 dPx = dFdx(P), dPy = dFdy(P);
-  float fp = sqrt(max(length(dPx) * length(dPy), 1e-10));
-  vec2 d;
-  if (uDirMode < 0.5) {
-    vec2 g = N.xz; float gl = length(g);
-    float na = (fbm2(P * 0.006) - 0.5) * 5.0 + uDirAng;
-    vec2 nd = vec2(cos(na), sin(na));
-    vec2 ct = gl > 1e-4 ? vec2(-g.y, g.x) / gl : nd;
-    if (dot(ct, nd) < 0.0) ct = -ct;
-    d = normalize(mix(nd, ct, smoothstep(0.04, 0.25, gl)) + 1e-5);
-  } else {
-    float na = uDirAng + (fbm2(P * 0.08) - 0.5) * 0.9;
-    d = vec2(cos(na), sin(na));
-  }
-  vec2 Pf = P + vec2(uTime * uDrift, 0.0);
-  float want = fp * uCellPx;
-  float lv = log2(max(want / uCell0, 1.0));
-  float l0 = floor(lv), fr = lv - l0;
-  float S0 = uCell0 * exp2(l0), S1 = S0 * 2.0;
-  Stroke a1 = noStroke(), a2 = noStroke(), b1 = noStroke(), b2 = noStroke();
-  strokeLayer(Pf / S0, 1.0, vec2(0.0), d, uLenT, uWidT, fp / S0, 3.0 + l0, 0.0, a1, a2);
-  strokeLayer(Pf / S1, 1.0, vec2(0.0), d, uLenT, uWidT, fp / S1, 4.0 + l0, 0.0, b1, b2);
-  vec3 col = groundColor(vPos, N, vec4(0.5, 0.95, 0.3, 0.95), dist) * 0.74;
-  float h = 0.0;
-  float ny = max(N.y, 0.25);
-  float alphaB = smoothstep(0.0, 0.3, fr);
-  if (b1.pri >= 0.0) {
-    vec2 Cc = b1.c * S1 - vec2(uTime * uDrift, 0.0);
-    vec3 Pc = vec3(Cc.x, vPos.y - (N.x * (Cc.x - vPos.x) + N.z * (Cc.y - vPos.z)) / ny, Cc.y);
-    float st = strokeStreak(b1);
-    float m = b1.m * alphaB;
-    col = mix(col, groundColor(Pc, N, b1.r, dist) * (0.9 + 0.2 * st), m);
-    h = mix(h, strokeHeight(b1, st), m);
-  }
-  float frA = fr * 1.2 - 0.1;
-  if (a1.pri >= 0.0) {
-    vec2 Cc = a1.c * S0 - vec2(uTime * uDrift, 0.0);
-    vec3 Pc = vec3(Cc.x, vPos.y - (N.x * (Cc.x - vPos.x) + N.z * (Cc.y - vPos.z)) / ny, Cc.y);
-    float st = strokeStreak(a1);
-    float m = a1.m * smoothstep(frA - 0.1, frA + 0.1, a1.r.w);
-    col = mix(col, groundColor(Pc, N, a1.r, dist) * (0.9 + 0.2 * st), m);
-    h = mix(h, strokeHeight(a1, st), m);
-  }
-  col = mix(col, gPC, gPW); h = mix(h, gPH, gPW);
-  col = mix(col, gMC, gMW); h = mix(h, 0.5, gMW * 0.5);
-  outColor = vec4(col, 1.0);
-  outInfo = vec4(h, uObjId, max(gPW, gMW) > 0.5 ? 0.0 : uInkW, max(gPW, gMW) > 0.5 ? 0.6 : 0.0);
+  outColor = vec4(c, 1.0);
+  outInfo = vec4(h, uObjId, 0.0, cdep > 0.0 ? frameMask(fd) : 0.0);
 }`;
 
+// o.exemplar: brushwork laid on the ground near the painter
+//   { rect: [u0, v0, u1, v1] (canvas uv, v up), scale: canvas heights per metre, patch: metres }
+//   { tex, tile: metres per texture repeat, patch: metres, wall: true for walls }
 function groundMaterial(env, o) {
-  const r6 = (a) => a.map(C);
-  const m = new THREE.ShaderMaterial({
+  const c = o.canvas;
+  const ex = o.exemplar;
+  const exRect = ex ? (ex.rect || [0, 0, 1, 1]) : [0, 0, 1, 1];
+  const exScale = !ex ? [1, 1] : (ex.tex ? [1 / ex.tile, 1 / ex.tile] : [ex.scale / c.aspect, ex.scale]);
+  return new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     uniforms: {
       ...env.shared,
-      uRB: { value: r6(o.base) }, uRA: { value: r6(o.zoneA || o.base) }, uRP: { value: r6(o.zoneB || o.base) }, uRF: { value: r6(o.field || o.base) },
-      uRegion: { value: o.region || null }, uRegionRect: { value: o.regionRect || new THREE.Vector4(0, 0, 1, 0) }, uHasRegion: { value: o.region ? 1 : 0 },
-      uFieldE: { value: o.fieldE || new THREE.Vector4(0, 0, 0, 0) },
-      uCell0: { value: o.cell ?? 0.35 }, uLenT: { value: o.len ?? 0.9 }, uWidT: { value: o.wid ?? 0.3 },
-      uDirMode: { value: o.dirMode ?? 0 }, uDirAng: { value: o.dirAng ?? 0.6 },
       uObjId: { value: o.id ?? nextId() },
-      uAccentAmt: { value: o.accentAmt ?? 0 }, uAccent0: { value: C((o.accent || ['#000', '#000'])[0]) }, uAccent1: { value: C((o.accent || ['#000', '#000'])[1]) },
-      uMid: { value: C(o.mid || '#000000') }, uMidAmt: { value: o.midAmt ?? 0 },
-      uInkW: { value: o.ink ?? 1 }, uDrift: { value: o.flow ?? 0 },
-      uLayer: { value: o.layer ?? 0 },
-      uLandShear: { value: o.landShear ?? 0.18 },
+      uLayer: { value: o.layer ?? 1 },
       uIsWater: { value: o.water ? 1 : 0 },
-      uExOn: { value: o.exemplar ? 1 : 0 },
-      uExRect: { value: new THREE.Vector4(...(o.exemplar ? o.exemplar.rect : [0, 0, 1, 1])) },
-      uExTile: { value: new THREE.Vector2(...(o.exemplar ? o.exemplar.tile : [10, 10])) },
-      uExAxis: { value: o.exemplar && o.exemplar.wall ? 1 : 0 },
-      uExTex: { value: (o.exemplar && o.exemplar.tex) || null }, uExOwn: { value: o.exemplar && o.exemplar.tex ? 1 : 0 },
-      ...canvasUniforms(o.canvas),
-      ...panoUniforms(o.canvas),
+      uMaskUp: { value: o.maskUp ? 1 : 0 },
+      uExOn: { value: ex ? 1 : 0 }, uExOwn: { value: ex && ex.tex ? 1 : 0 }, uExAxis: { value: ex && ex.wall ? 1 : 0 },
+      uExRect: { value: new THREE.Vector4(...exRect) }, uExScale: { value: new THREE.Vector2(...exScale) },
+      uExPatch: { value: (ex && ex.patch) || 3 }, uExTex: { value: (ex && ex.tex) || BLACK_TEX },
+      uExMean: { value: new THREE.Vector3(...((ex && ex.mean) || exemplarMean(c, ex))) }, uExRowH: { value: (ex && ex.rowH) || 0 },
+      ...c.uniforms,
     },
     vertexShader: GROUND_VS, fragmentShader: GROUND_FS,
     side: o.side ?? THREE.FrontSide,
   });
-  if (o.lamps) {
-    m.defines = { WATER: 1 };
-    const L = o.lamps.map((l) => new THREE.Vector4(l.x, l.y, l.z, l.w ?? 1));
-    while (L.length < 32) L.push(new THREE.Vector4());
-    m.uniforms.uLamps = { value: L.slice(0, 32) };
-    m.uniforms.uLampN = { value: Math.min(32, o.lamps.length) };
-    m.uniforms.uStreakW = { value: o.streakW ?? 0.012 };
-    m.uniforms.uStreakLen = { value: o.streakLen ?? 6 };
-  }
-  return m;
 }
 
-// A float RGBA texture sampled by ground + grass: R height, G grass density, B zone A, A zone B.
-function makeRegionTexture(size, rect, fn) {
-  const data = new Float32Array(size * size * 4);
-  for (let j = 0; j < size; j++) {
-    const z = rect.z0 + (j + 0.5) / size * rect.size;
-    for (let i = 0; i < size; i++) {
-      const x = rect.x0 + (i + 0.5) / size * rect.size;
-      const v = fn(x, z);
-      data.set(v, (j * size + i) * 4);
-    }
-  }
-  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.FloatType);
-  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.magFilter = tex.minFilter = FLOAT_LINEAR ? THREE.LinearFilter : THREE.NearestFilter;
-  tex.needsUpdate = true;
-  tex.userData.rect = new THREE.Vector4(rect.x0, rect.z0, rect.size, 0);
-  return tex;
-}
-let FLOAT_LINEAR = true;
-
-// Heightfield mesh, dense near `center`, sparse toward the horizon.
+// Heightfield mesh, dense near `center`, sparse toward the horizon. Normals come from the grid itself.
 function terrainGeometry(heightFn, R, n = 256, center = { x: 0, z: 0 }, a = 0.12) {
   const g = new THREE.BufferGeometry();
   const N = n + 1;
   const pos = new Float32Array(N * N * 3), nrm = new Float32Array(N * N * 3);
   const map = (u) => R * (a * u + (1 - a) * u * u * u);
+  const xs = new Float32Array(N);
+  for (let i = 0; i < N; i++) xs[i] = map(i / n * 2 - 1);
   for (let j = 0; j < N; j++) {
-    const z = center.z + map(j / n * 2 - 1);
+    const z = center.z + xs[j];
     for (let i = 0; i < N; i++) {
-      const x = center.x + map(i / n * 2 - 1);
+      const x = center.x + xs[i];
       const k = (j * N + i) * 3;
-      const h = heightFn(x, z);
-      pos[k] = x; pos[k + 1] = h; pos[k + 2] = z;
-      const e = 0.8;
-      const hx = heightFn(x + e, z) - heightFn(x - e, z);
-      const hz = heightFn(x, z + e) - heightFn(x, z - e);
-      const v = V3(-hx, 2 * e, -hz).normalize();
-      nrm[k] = v.x; nrm[k + 1] = v.y; nrm[k + 2] = v.z;
+      pos[k] = x; pos[k + 1] = heightFn(x, z); pos[k + 2] = z;
     }
+  }
+  const t1 = V3(), t2 = V3(), nv = V3();
+  const P = (i, j, out) => { const k = (j * N + i) * 3; return out.set(pos[k], pos[k + 1], pos[k + 2]); };
+  const a0 = V3(), b0 = V3();
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    P(Math.min(i + 1, n), j, a0); P(Math.max(i - 1, 0), j, b0); t1.subVectors(a0, b0);
+    P(i, Math.min(j + 1, n), a0); P(i, Math.max(j - 1, 0), b0); t2.subVectors(a0, b0);
+    nv.crossVectors(t2, t1).normalize();
+    const k = (j * N + i) * 3;
+    nrm[k] = nv.x; nrm[k + 1] = nv.y; nrm[k + 2] = nv.z;
   }
   const idx = new Uint32Array(n * n * 6);
   let t = 0;
   for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
-    const a0 = j * N + i, b0 = a0 + 1, c0 = a0 + N, d0 = c0 + 1;
-    idx[t++] = a0; idx[t++] = c0; idx[t++] = b0;
-    idx[t++] = b0; idx[t++] = c0; idx[t++] = d0;
+    const a1 = j * N + i, b1 = a1 + 1, c1 = a1 + N, d1 = c1 + 1;
+    idx[t++] = a1; idx[t++] = c1; idx[t++] = b1;
+    idx[t++] = b1; idx[t++] = c1; idx[t++] = d1;
   }
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
   g.setIndex(new THREE.BufferAttribute(idx, 1));
   g.computeBoundingSphere();
   return g;
-}
-
-// ----- Grass and wheat: camera-following tufts, each blade a single brushstroke -----
-const GRASS_VS = /* glsl */`
-in vec3 aOff; in vec4 aRnd;
-uniform sampler2D uRegion; uniform vec4 uRegionRect; uniform vec3 uCam; uniform float uTile; uniform float uTime; uniform vec2 uWind;
-uniform vec2 uSize; uniform vec2 uWheatSize;
-out vec2 vUv; out vec4 vRnd; out vec3 vPos; out float vWheat; out float vFade;
-void main(){
-  vec2 rel = mod(aOff.xz - uCam.xz + uTile * 0.5, uTile) - uTile * 0.5;
-  vec2 wp = uCam.xz + rel;
-  vec4 reg = texture(uRegion, (wp - uRegionRect.xy) / uRegionRect.z);
-  float dist = length(rel);
-  float wheat = step(aRnd.z, reg.b);
-  float keep = step(aRnd.w, max(reg.g, wheat));
-  float fade = (1.0 - smoothstep(uTile * 0.3, uTile * 0.48, dist)) * keep;
-  float H = mix(uSize.y * (0.55 + 0.6 * aRnd.x), uWheatSize.y * (0.8 + 0.35 * aRnd.x), wheat) * fade;
-  float W = mix(uSize.x, uWheatSize.x, wheat) * (0.8 + 0.4 * aRnd.y) * fade;
-  vec3 toCam = vec3(uCam.x - wp.x, 0.0, uCam.z - wp.y);
-  vec3 right = normalize(vec3(-toCam.z, 0.0, toCam.x) + vec3(1e-4, 0.0, 0.0));
-  float y0 = reg.r - 0.12;
-  vec3 pos = vec3(wp.x, y0, wp.y) + right * position.x * W + vec3(0.0, position.y * (H + 0.12), 0.0);
-  float gust = sin(uTime * 1.1 + wp.x * 0.09 + wp.y * 0.06) * 0.6 + sin(uTime * 2.3 + wp.x * 0.31 + wp.y * 0.17) * 0.25;
-  pos.xz += uWind * (gust + 0.35) * position.y * position.y * H * 0.4;
-  vUv = position.xy; vRnd = aRnd; vPos = pos; vWheat = wheat; vFade = fade;
-  gl_Position = projectionMatrix * viewMatrix * vec4(pos, 1.0);
-}`;
-const GRASS_FS = /* glsl */`
-${GL_COMMON}
-${GL_ENV}
-${GL_OUT}
-in vec2 vUv; in vec4 vRnd; in vec3 vPos; in float vWheat; in float vFade;
-uniform vec3 uGR[6]; uniform vec3 uWR[6]; uniform float uObjId;
-void main(){
-  if (vFade < 0.02) discard;
-  float best = -1.0; vec4 bh = vec4(0.0); float bt = 0.0; float bx = 0.0;
-  for (int i = 0; i < 9; i++){
-    vec4 h = hash42(vRnd.xy * 113.0 + float(i) * 7.31);
-    float top = 0.4 + 0.6 * h.z;
-    float t = vUv.y / top;
-    if (t > 1.0) continue;
-    float cx = (h.x - 0.5) * 0.76 + (h.y - 0.5) * 0.6 * t * t;
-    float w = mix(0.045, 0.075, vWheat) * (1.0 - t * 0.8) * (0.8 + 0.4 * h.w);
-    if (vWheat > 0.5 && t > 0.72) w *= 1.9;
-    float dx = abs(vUv.x - cx) / w;
-    if (dx < 1.0 && h.w > best) { best = h.w; bh = h; bt = t; bx = dx; }
-  }
-  if (best < 0.0) discard;
-  float v = uAmb + uKey * (0.15 + 0.85 * bt) * 0.85 + (bh.z - 0.5) * 0.3 + (bh.x - 0.5) * 0.1;
-  vec3 col = vWheat > 0.5 ? RAMP6(uWR, v + 0.05) : RAMP6(uGR, v);
-  vec3 tint; float w = pointLights(vPos, vec3(0.0, 1.0, 0.0), tint);
-  float wj = w + (bh.y - 0.5) * 0.3;
-  col = mix(col, warmRamp(wj) * tint, smoothstep(0.12, 0.6, wj));
-  col *= 0.92 + 0.16 * vnoise(vec2(bx * 3.0, bt * 2.0 + bh.x * 9.0));
-  outColor = vec4(col, 1.0);
-  outInfo = vec4(0.65 * (1.0 - bx * bx), uObjId, 0.0, 0.0);
-}`;
-
-function makeGrass(env, o) {
-  const count = o.count ?? 16000, tile = o.tile ?? 90;
-  const base = new THREE.PlaneGeometry(1, 1, 1, 3);
-  base.translate(0, 0.5, 0);
-  const g = new THREE.InstancedBufferGeometry();
-  g.index = base.index;
-  g.setAttribute('position', base.attributes.position);
-  const off = new Float32Array(count * 3), rnd = new Float32Array(count * 4);
-  const rand = mulberry(o.seed ?? 7);
-  for (let i = 0; i < count; i++) {
-    off[i * 3] = rand() * tile; off[i * 3 + 2] = rand() * tile;
-    for (let k = 0; k < 4; k++) rnd[i * 4 + k] = rand();
-  }
-  g.setAttribute('aOff', new THREE.InstancedBufferAttribute(off, 3));
-  g.setAttribute('aRnd', new THREE.InstancedBufferAttribute(rnd, 4));
-  g.instanceCount = count;
-  const m = new THREE.ShaderMaterial({
-    glslVersion: THREE.GLSL3,
-    uniforms: {
-      ...env.shared,
-      uRegion: { value: o.region }, uRegionRect: { value: o.region.userData.rect },
-      uCam: { value: V3() }, uTile: { value: tile }, uWind: { value: new THREE.Vector2(...(o.wind || [0.8, 0.3])) },
-      uSize: { value: new THREE.Vector2(...(o.size || [0.8, 0.6])) }, uWheatSize: { value: new THREE.Vector2(...(o.wheatSize || [0.9, 1.15])) },
-      uGR: { value: o.grass.map(C) }, uWR: { value: (o.wheat || o.grass).map(C) }, uObjId: { value: o.id },
-    },
-    vertexShader: GRASS_VS, fragmentShader: GRASS_FS,
-    side: THREE.DoubleSide,
-  });
-  const mesh = new THREE.Mesh(g, m);
-  mesh.frustumCulled = false;
-  mesh.userData.update = (t, dt, cam) => m.uniforms.uCam.value.copy(cam.position);
-  return mesh;
 }
 
 // ==== 05-geo.js ====
@@ -1827,101 +1699,10 @@ function addBasin(scene, env, pos, o = {}) {
 
 // ==== 06-sky.js ====
 // ---------------------------------------------------------------------------
-// Painted skies. One parametric shader: swirling wind, vortices, star halos,
-// bursts or flower-stars, a crescent moon, and strokes that keep repainting.
-// The dome is parameterised stereographically (s = dir.xz / (1 + dir.y)).
-// The static wind field and base colour are baked once into a texture; the
-// per-pixel shader only adds what moves (spiral arms, pulsing halos, strokes).
+// The sky dome: Vincent's canvas inside the frame and the canvas continued around
+// the painter outside it (GL_EXT). Below the far skyline it shows his distant land,
+// so the horizon is the painted one inside the frame and carries on past it.
 // ---------------------------------------------------------------------------
-
-const SKY_RANGE = 1.65; // baked field covers s in [-RANGE, RANGE]^2
-
-const SKY_UNIFORMS = /* glsl */`
-uniform float uTime;
-uniform vec4 uVort[8]; uniform int uVortN;
-uniform vec4 uStar[24]; uniform int uStarN;
-uniform vec4 uMoon; uniform float uMoonOn;
-uniform float uHorizonV; uniform float uZenithV; uniform float uBand; uniform float uWave; uniform float uArm; uniform float uMottle;
-uniform float uStarStyle; uniform float uHorizonBand;
-`;
-
-const SKY_FIELD_FS = /* glsl */`
-${GL_COMMON}
-${SKY_UNIFORMS}
-in vec2 vUv;
-layout(location = 0) out vec4 outColor;
-vec2 skyDir(vec2 s){
-  float r0 = length(s) + 1e-4;
-  vec2 tang = vec2(-s.y, s.x) / r0;
-  float wav = uWave * (0.45 * sin(r0 * 11.0 + atan(s.y, s.x) * 3.0) + 1.1 * (fbm2(s * 2.2 + 0.3) - 0.5));
-  vec2 f = rot2(tang, wav);
-  for (int i = 0; i < 8; i++){
-    if (i >= uVortN) break;
-    vec4 V = uVort[i];
-    vec2 q = s - V.xy; float r = length(q);
-    if (r > V.z * 2.6) continue;
-    vec2 rh = q / max(r, 1e-5);
-    vec2 th = vec2(-rh.y, rh.x) * sign(V.w);
-    vec2 vd = normalize(th - rh * 0.3);
-    float x = r / V.z;
-    f += vd * abs(V.w) * 3.2 * exp(-x * x * 1.1);
-  }
-  float fl = length(f);
-  vec2 fn = f / max(fl, 1e-5);
-  vec2 T = vec2(fn.x * fn.x - fn.y * fn.y, 2.0 * fn.x * fn.y) * fl;
-  for (int i = 0; i < 24; i++){
-    if (i >= uStarN) break;
-    vec4 S = uStar[i];
-    vec2 q = s - S.xy; float r = length(q);
-    if (r > S.z * 1.8) continue;
-    vec2 rh = q / max(r, 1e-5);
-    vec2 sd = uStarStyle > 0.5 ? rh : vec2(-rh.y, rh.x);
-    if (uStarStyle > 1.5 && r > S.z * 0.78) sd = vec2(-rh.y, rh.x);
-    float x = r / S.z;
-    T += vec2(sd.x * sd.x - sd.y * sd.y, 2.0 * sd.x * sd.y) * 4.0 * exp(-x * x * 1.4);
-  }
-  if (uMoonOn > 0.5) {
-    vec2 q = s - uMoon.xy; float r = length(q);
-    if (r < uMoon.z * 2.0) {
-      vec2 th = vec2(-q.y, q.x) / max(r, 1e-5);
-      float x = r / uMoon.z;
-      T += vec2(th.x * th.x - th.y * th.y, 2.0 * th.x * th.y) * 4.0 * exp(-x * x * 1.2);
-    }
-  }
-  float a = 0.5 * atan(T.y, T.x);
-  vec2 d = vec2(cos(a), sin(a));
-  if (dot(d, f) < 0.0) d = -d;
-  return d;
-}
-float skyValueStatic(vec2 s){
-  float r0 = length(s);
-  float el = 1.5707963 - 2.0 * atan(r0);
-  float v = mix(uHorizonV, uZenithV, smoothstep(0.0, 1.15, el));
-  v += uHorizonBand * exp(-pow((el - 0.05) / 0.06, 2.0));
-  v += uMottle * (fbm(s * 3.1 + 1.7) - 0.5);
-  float band = sin(r0 * 36.0 + 6.0 * fbm2(s * 2.0 + 4.0) + atan(s.y, s.x) * 2.0);
-  v += uBand * band;
-  for (int i = 0; i < 8; i++){
-    if (i >= uVortN) break;
-    vec4 V = uVort[i];
-    float x = length(s - V.xy) / V.z;
-    v += (0.28 * exp(-x * x * 16.0) - 0.1 * exp(-x * x * 1.25)) * abs(V.w);
-  }
-  for (int i = 0; i < 24; i++){
-    if (i >= uStarN) break;
-    float x = length(s - uStar[i].xy) / uStar[i].z;
-    if (uStarStyle < 0.5) v += 0.2 * exp(-x * x * 1.5);
-    else if (uStarStyle < 1.5) v += 0.25 * exp(-x * x * 2.0);
-    else v += 0.5 * exp(-pow((x - 0.88) / 0.12, 2.0)) + 0.15 * exp(-x * x * 2.0);
-  }
-  if (uMoonOn > 0.5) { float x = length(s - uMoon.xy) / uMoon.z; v += 0.22 * exp(-x * x * 1.2); }
-  return v;
-}
-void main(){
-  vec2 s = (vUv * 2.0 - 1.0) * ${SKY_RANGE.toFixed(3)};
-  vec2 d = skyDir(s);
-  outColor = vec4(d, skyValueStatic(s), 1.0);
-}`;
 
 const SKY_VS = /* glsl */`
 out vec3 vDir;
@@ -1934,261 +1715,37 @@ const SKY_FS = /* glsl */`
 ${GL_COMMON}
 ${GL_STROKE}
 ${GL_OUT}
-${SKY_UNIFORMS}
+uniform float uTime;
 ${GL_CANVAS}
-${GL_PANO}
+${GL_EXT}
 in vec3 vDir;
-uniform sampler2D uField;
-uniform float uCell; uniform float uLen; uniform float uWid;
-uniform vec3 uSky[6]; uniform vec3 uGlowR[6]; uniform vec3 uMoonR[6];
-uniform float uSmallStars; uniform float uCoreK;
-uniform float uAnim; uniform float uWindSpeed; uniform float uObjId; uniform float uDbg;
-
-float starGlow(int i, vec2 s){
-  vec4 S = uStar[i];
-  vec2 q = s - S.xy; float r = length(q); float x = r / S.z;
-  if (x > 1.3) return 0.0;
-  float fi = float(i);
-  if (uStarStyle < 0.5) {
-    float ring = 0.5 + 0.5 * cos(x * 15.0 - uTime * 0.9 - fi);
-    return (1.0 - smoothstep(0.25, 1.05, x)) * (0.35 + 0.65 * ring) * S.w;
-  }
-  float ang = atan(q.y, q.x);
-  if (uStarStyle < 1.5) {
-    float rays = pow(0.5 + 0.5 * cos(ang * 7.0 + fi * 1.7 + sin(uTime * 0.5 + fi) * 0.25), 2.0);
-    return (1.0 - smoothstep(0.12, 1.0, x)) * (0.2 + 0.8 * rays) * S.w;
-  }
-  float pet = pow(0.5 + 0.5 * cos(ang * 8.0 + fi * 2.1 + sin(uTime * 0.4 + fi) * 0.2), 1.5);
-  return (1.0 - smoothstep(0.22, 0.74, x)) * (0.3 + 0.7 * pet) * S.w;
-}
-
-float armsLive(vec2 s){
-  float v = 0.0;
-  for (int i = 0; i < 8; i++){
-    if (i >= uVortN) break;
-    vec4 V = uVort[i];
-    vec2 q = s - V.xy;
-    float x = length(q) / V.z;
-    if (x > 2.2) continue;
-    float ang = atan(q.y, q.x) * sign(V.w);
-    float arm = 0.5 + 0.5 * cos(2.0 * (ang + 2.4 * log(x + 0.04)) - uTime * 0.16);
-    v += exp(-x * x * 1.25) * uArm * arm * abs(V.w);
-  }
-  return v;
-}
-
-int gN1, gN2;
-vec3 gPanoCol = vec3(0.0); float gPanoH = 0.0; float gZen = 1.0;
-vec3 sToDir(vec2 s){ float q = dot(s, s); return vec3(2.0 * s.x, 1.0 - q, 2.0 * s.y) / (1.0 + q); }
-vec3 skyStrokeCol(Stroke st, float vPix, float streak){
-  vec2 cs = st.c * uCell;
-  float moon = 0.0, g = 0.0;
-  if (gN1 >= 0) g = starGlow(gN1, cs);
-  if (gN2 >= 0) g = max(g, starGlow(gN2, cs));
-  if (uMoonOn > 0.5) {
-    float x = length(cs - uMoon.xy) / uMoon.z;
-    if (x < 1.3) {
-      float ring = 0.5 + 0.5 * cos(x * 13.0 - uTime * 0.7);
-      float mh = (1.0 - smoothstep(0.3, 1.05, x)) * (0.45 + 0.55 * ring);
-      if (mh > g) { g = mh; moon = 1.0; }
-    }
-  }
-  float v = vPix + (st.r.z - 0.5) * 0.28 + (streak - 0.5) * 0.08;
-  vec3 col = RAMP6(uSky, v);
-  float yp = smoothstep(0.06, 0.65, g);
-  if (st.r.w < yp) {
-    float gv = sat(g + (st.r.y - 0.5) * 0.35);
-    col = moon > 0.5 ? RAMP6(uMoonR, gv) : RAMP6(uGlowR, gv);
-  }
-  col *= 0.93 + 0.14 * streak;
-  if (uCanvasOn > 0.5) { float fr; vec2 cu = canvasUVDir(sToDir(cs), fr); if (fr > 0.0) col = edgeContinue(col, cu); }
-  return col;
-}
-
-void starCore(int i, vec2 s, float pxs, inout vec3 col, inout float h){
-  vec4 S = uStar[i];
-  vec2 q = s - S.xy; float r = length(q); float R = S.z * uCoreK * S.w;
-  if (r > R * 1.6) return;
-  float ang = atan(q.y, q.x); float k = r / R;
-  float wob = (vnoise(vec2(ang * 2.5 + float(i) * 7.0, uTime * 0.5)) - 0.5) * 0.2;
-  float aaK = pxs / R;
-  float m = 1.0 - smoothstep(0.9 - aaK, 1.0 + aaK, k + wob);
-  float sw = vnoise(vec2(ang * 3.0 - k * 5.0 + uTime * 0.7, k * 4.0 + float(i)));
-  vec3 cc = mix(vec3(1.0, 0.99, 0.9), vec3(0.98, 0.87, 0.38), smoothstep(0.1, 0.95, k + (sw - 0.5) * 0.5));
-  col = mix(col, cc * 1.1, m);
-  h = mix(h, 0.95 * (1.0 - 0.4 * k * k) * (0.75 + 0.25 * sw), m);
-}
-
+uniform float uObjId;
 void main(){
   vec3 dir = normalize(vDir);
-  PanoS pano = panoOf(dir);
-  if (uCanvasOn > 0.5) {
-    float front; vec2 cuv = canvasUVDir(dir, front);
-    if (front > 0.0 && inFrame(cuv)) {
-      int top = topLayer(cuv);
-      vec3 c; float hh = 0.0; float painted = 0.0;
-      if (top == 0) { c = paintFlow(cuv); hh = paintRelief(cuv); painted = 1.0; paintCurrents(cuv, c, hh); }
-      else { c = texture(uFillA, cuv).rgb; canvasDetail(cuv, 0, 1, c, hh); }
-      outColor = vec4(c, 1.0);
-      outInfo = vec4(hh, uObjId, painted > 0.5 ? 0.0 : 1.0, painted);
-      return;
-    }
+  Grid g = dirGrid(dir);
+  float fd; vec2 uv = extCoord(dir, fd);
+  bool land = degrees(asin(clamp(dir.y, -1.0, 1.0))) < horizAt(dir);
+  vec3 c = vec3(0.0); float h = 0.5; float wP = 0.0;
+  if (fd < 0.0) {
+    int top = topLayer(uv);
+    if (top == 0) { c = paintFlow(uv); h = paintRelief(uv); paintCurrents(uv, c, h); land = false; }
+    else if (top == 1) { c = paintAt(uv); h = paintRelief(uv); land = true; }
+    else if (land && fillValid(1, uv)) { c = texture(uFillB, uv).rgb; canvasDetail(uv, 1, 1, c, h); }
+    else { c = texture(uFillA, uv).rgb; canvasDetail(uv, 0, 1, c, h); land = false; }
+    wP = paintWeight(uv, fd);
   }
-  float gMW = 0.0; vec3 gMC = vec3(0.0);
-  if (uCanvasOn > 0.5) {
-    float front; vec2 cuv = canvasUVDir(dir, front);
-    float far; vec2 m = extUV(dir, cuv, front, far);
-    float camEl = degrees(asin(clamp((uC0R * dir).y, -1.0, 1.0)));
-    float hm = extHalo(m);
-    // reflected stars right next to the frame (and the moon anywhere) would read as duplicates:
-    // blend in halo-free sky borrowed from elsewhere in the painting
-    float wsub = 0.0; vec2 alt = m;
-    bool consider = hm > 0.7 || (hm > 0.12 && far < 0.6);
-    if (consider && uDbg < 0.5) {
-      vec2 offs[8] = vec2[8](vec2(0.14, -0.04), vec2(-0.17, -0.06), vec2(0.29, -0.02), vec2(-0.33, -0.08),
-                             vec2(0.46, -0.05), vec2(-0.5, -0.03), vec2(0.63, -0.07), vec2(-0.71, -0.04));
-      for (int k = 0; k < 8; k++) {
-        float ay = m.y + offs[k].y;
-        if (ay < 1.0 - uBands.x) ay = m.y - offs[k].y;
-        vec2 cand = vec2(triWave(m.x + offs[k].x), clamp(ay, 0.001, 0.995));
-        if (extHalo(cand) < 0.1 && topLayer(cand) == 0) { alt = cand; wsub = hm > 0.7 ? smoothstep(0.62, 0.9, hm) : smoothstep(0.12, 0.42, hm); break; }
-      }
-    }
-    float supp = 0.0;
-    gMW = (1.0 - supp) * (1.0 - smoothstep(58.0, 70.0, camEl));
-    if (gMW > 0.002) {
-      gMC = topLayer(m) == 0 ? paintFlow(m) : texture(uFillA, m).rgb;
-      if (wsub > 0.0) gMC = mix(gMC, paintFlow(alt), wsub);
-      float hx = 0.0; paintCurrents(wsub > 0.5 ? alt : m, gMC, hx);
-    }
-    if (gMW > 0.985) {
-      outColor = vec4(gMC, 1.0);
-      outInfo = vec4(paintRelief(m), uObjId, 0.0, 0.6);
-      return;
-    }
+  if (wP < 0.999) {
+    float he; vec3 e = land ? extLand(dir, g, uv, fd, he) : extSky(dir, g, uv, fd, he);
+    c = mix(e, c, wP); h = mix(he, h, wP);
   }
-  float zen = smoothstep(70.0, 80.0, pano.el);
-  if (panoCovers(pano) && zen < 0.999) {
-    vec3 c = panoFlowAt(pano); float hh = panoRelief(pano);
-    panoDetail(pano, true, c, hh);
-    if (zen <= 0.001) {
-      outColor = vec4(c, 1.0);
-      outInfo = vec4(hh, uObjId, 0.0, 1.0);
-      return;
-    }
-    gPanoCol = c; gPanoH = hh; gZen = zen;
-  }
-  float y = max(dir.y, -0.45);
-  vec2 s = dir.xz / (1.0 + y);
-  vec4 F = texture(uField, s / ${(2 * SKY_RANGE).toFixed(3)} + 0.5);
-  vec2 d = normalize(F.xy + vec2(1e-5, 0.0));
-  // the two stars whose halos might touch this pixel
-  gN1 = -1; gN2 = -1;
-  float x1 = 1.5, x2 = 1.5;
-  for (int i = 0; i < 24; i++){
-    if (i >= uStarN) break;
-    float x = length(s - uStar[i].xy) / uStar[i].z;
-    if (x < x1) { x2 = x1; gN2 = gN1; x1 = x; gN1 = i; } else if (x < x2) { x2 = x; gN2 = i; }
-  }
-  vec2 p = s / uCell;
-  float aa = length(fwidth(p));
-  Stroke s1 = noStroke(), s2 = noStroke();
-  strokeLayer(p, 1.0, vec2(0.0), d, uLen, uWid, aa, 1.0, 0.0, s1, s2);
-  strokeLayer(p, 1.19, vec2(0.37, 0.61), d, uLen * 0.95, uWid * 0.92, aa, 2.0, 1.0, s1, s2);
-  if (uAnim > 0.0) strokeLayerAnim(p, 0.93, vec2(0.71, 0.23), d, 0.62, uWid * 0.95, aa, 3.0, 2.0, uTime, uWindSpeed, 0.5, s1, s2);
-  float vPix = F.z + armsLive(s);
-  vec3 col = RAMP6(uSky, vPix - 0.22) * 0.72;
-  float h = 0.0;
-  if (s2.pri >= 0.0) { float st = strokeStreak(s2); col = mix(col, skyStrokeCol(s2, vPix, st), s2.m); h = mix(h, strokeHeight(s2, st), s2.m); }
-  if (s1.pri >= 0.0) { float st = strokeStreak(s1); col = mix(col, skyStrokeCol(s1, vPix, st), s1.m); h = mix(h, strokeHeight(s1, st), s1.m); }
-
-  float pxs = length(fwidth(s));
-  if (uSmallStars > 0.0) {
-    vec2 g = s / 0.05; vec2 gi = floor(g);
-    vec4 hh = hash42(gi + 17.0);
-    if (hh.z < uSmallStars) {
-      vec2 sp = gi + 0.2 + 0.6 * hh.xy;
-      float dd = length(g - sp) * 0.05;
-      float rad = 0.0028 + 0.0036 * hh.w;
-      float m = 1.0 - smoothstep(rad * 0.6 - pxs, rad + pxs, dd);
-      float tw = 0.75 + 0.25 * sin(uTime * (1.0 + hh.w * 2.0) + hh.x * 30.0);
-      col = mix(col, mix(vec3(0.98, 0.9, 0.5), vec3(1.0, 0.98, 0.85), hh.y) * tw, m);
-      h = max(h, m * 0.7);
-    }
-  }
-  if (gN1 >= 0) starCore(gN1, s, pxs, col, h);
-  if (gN2 >= 0) starCore(gN2, s, pxs, col, h);
-  if (uMoonOn > 0.5) {
-    vec2 q = s - uMoon.xy; float r = length(q); float R = uMoon.w;
-    if (r < R * 1.6) {
-      vec2 up = -normalize(uMoon.xy); vec2 rt = vec2(up.y, -up.x);
-      float k = r / R;
-      float ang = atan(q.y, q.x);
-      float wob = (vnoise(vec2(ang * 2.0, uTime * 0.3)) - 0.5) * 0.12;
-      float aaK = pxs / R;
-      float m = 1.0 - smoothstep(0.92 - aaK, 1.0 + aaK, k + wob);
-      vec2 off = (-0.42 * rt + 0.32 * up) * R;
-      float k2 = length(q - off) / (R * 0.9);
-      float cres = smoothstep(0.92, 1.05, k2);
-      float sw = vnoise(vec2(ang * 3.0 + k * 6.0 - uTime * 0.4, k * 5.0));
-      vec3 dark = mix(vec3(0.86, 0.47, 0.13), vec3(0.95, 0.62, 0.2), sw);
-      vec3 lit = mix(vec3(1.0, 0.97, 0.72), vec3(0.99, 0.86, 0.4), sw * 0.7);
-      col = mix(col, mix(dark, lit, cres) * 1.08, m);
-      h = mix(h, 0.9 * (0.7 + 0.3 * sw), m);
-    }
-  }
-  col = mix(gPanoCol, col, gZen); h = mix(gPanoH, h, gZen);
-  col = mix(col, gMC, gMW); h = mix(h, 0.5, gMW * 0.5);
-  outColor = vec4(col, 1.0);
-  outInfo = vec4(h, uObjId, gMW > 0.5 ? 0.0 : 1.0, gMW > 0.5 ? 0.6 : 0.0);
+  outColor = vec4(c, 1.0);
+  outInfo = vec4(h, uObjId, 0.0, frameMask(fd));
 }`;
 
-function bakeSkyField(uniforms, size = 1024) {
-  const rt = new THREE.WebGLRenderTarget(size, size, { type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
-  const mat = new THREE.ShaderMaterial({
-    glslVersion: THREE.GLSL3, uniforms,
-    vertexShader: POST_VS, fragmentShader: SKY_FIELD_FS, depthTest: false, depthWrite: false,
-  });
-  const tri = new THREE.BufferGeometry();
-  tri.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
-  const sc = new THREE.Scene();
-  const mesh = new THREE.Mesh(tri, mat); mesh.frustumCulled = false; sc.add(mesh);
-  renderer.setRenderTarget(rt);
-  renderer.render(sc, new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1));
-  renderer.setRenderTarget(null);
-  mat.dispose(); tri.dispose();
-  return rt.texture;
-}
-
 function skyMesh(env, o) {
-  const pad4 = (arr, n) => { const out = arr.slice(0, n); while (out.length < n) out.push(new THREE.Vector4()); return out; };
-  const vort = (o.vortices || []).map(([az, el, rad, spin]) => { const s = skyS(az, el); return new THREE.Vector4(s.x, s.y, skyR(el, rad), spin); });
-  const stars = (o.stars || []).map(([az, el, rad, size]) => { const s = skyS(az, el); return new THREE.Vector4(s.x, s.y, skyR(el, rad), size); });
-  const moon = new THREE.Vector4();
-  let moonOn = 0;
-  if (o.moon) { const [az, el, halo, disc] = o.moon; const s = skyS(az, el); moon.set(s.x, s.y, skyR(el, halo), skyR(el, disc)); moonOn = 1; }
-  const shared = {
-    uTime: env.shared.uTime,
-    uVort: { value: pad4(vort, 8) }, uVortN: { value: vort.length },
-    uStar: { value: pad4(stars, 24) }, uStarN: { value: stars.length },
-    uMoon: { value: moon }, uMoonOn: { value: moonOn },
-    uHorizonV: { value: o.horizonV ?? 0.6 }, uZenithV: { value: o.zenithV ?? 0.18 }, uHorizonBand: { value: o.horizonBand ?? 0 },
-    uBand: { value: o.band ?? 0.06 }, uWave: { value: o.wave ?? 1 }, uArm: { value: o.arm ?? 0.6 }, uMottle: { value: o.mottle ?? 0.12 },
-    uStarStyle: { value: o.starStyle ?? 0 },
-  };
-  const field = bakeSkyField(shared);
   const m = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: {
-      ...shared,
-      uField: { value: field },
-      uCell: { value: o.cell ?? 0.017 }, uLen: { value: o.len ?? 0.85 }, uWid: { value: o.wid ?? 0.26 },
-      uSky: { value: o.sky.map(C) }, uGlowR: { value: (o.glow || o.sky).map(C) }, uMoonR: { value: (o.moonRamp || o.glow || o.sky).map(C) },
-      uSmallStars: { value: o.smallStars ?? 0 }, uCoreK: { value: o.coreK ?? 0.24 },
-      uAnim: { value: o.anim ?? 1 }, uWindSpeed: { value: o.windSpeed ?? 0.09 }, uObjId: { value: nextId() }, uDbg: { value: 0 },
-      ...canvasUniforms(o.canvas),
-      ...panoUniforms(o.canvas),
-    },
+    uniforms: { uTime: env.shared.uTime, uObjId: { value: nextId() }, ...o.canvas.uniforms },
     vertexShader: SKY_VS, fragmentShader: SKY_FS,
     side: THREE.BackSide, depthWrite: true,
   });
@@ -2201,8 +1758,10 @@ function skyMesh(env, o) {
 
 // ==== 07-post.js ====
 // ---------------------------------------------------------------------------
-// Post: painted contours, impasto relief under a raking gallery light, canvas
-// weave, grading, and the silver-pool (pensieve) transition.
+// Post: painted contours, impasto relief under a raking gallery light, grading,
+// and the silver-pool (pensieve) transition. Everything is treated the same inside
+// and outside the painted frame, so its edge never shows. The scene may be rendered
+// into the lower-left part of the targets (uScale) when the resolution drops.
 // ---------------------------------------------------------------------------
 
 const POST_VS = /* glsl */`
@@ -2218,9 +1777,10 @@ uniform vec2 uRes; uniform float uDpr; uniform float uTime; uniform float uNear;
 uniform vec3 uInk; uniform float uInkPx; uniform float uImpasto; uniform float uGloss;
 uniform float uTrans; uniform float uSpin; uniform vec3 uMistTint;
 uniform float uVig; uniform vec3 uVigCol; uniform float uSat; uniform float uBright; uniform float uFadeBlack; uniform float uBlur;
-uniform float uPaintImp; uniform float uHideWorld;
+uniform float uPaintImp; uniform float uHideWorld; uniform vec2 uScale;
 
 float lin(float d){ return uNear * uFar / (uFar - d * (uFar - uNear)); }
+vec2 S(vec2 uv){ return clamp(uv, 0.5 / uRes, uScale - 0.5 / uRes); }
 
 void main(){
   float aspect = uRes.x / uRes.y;
@@ -2241,24 +1801,25 @@ void main(){
   }
   vec2 suv = cw / vec2(aspect, 1.0) + 0.5;
   suv = 1.0 - abs(1.0 - abs(suv));
+  vec2 tuv = S(suv * uScale);
 
   vec2 px = 1.0 / uRes;
-  vec3 col = texture(tColor, suv).rgb;
-  vec4 inf = texture(tInfo, suv);
+  vec3 col = texture(tColor, tuv).rgb;
+  vec4 inf = texture(tInfo, tuv);
 
   // ---- Contours: inverse-depth Laplacian (silhouettes, creases) + object id changes
   float wline = uInkPx * (0.5 + 1.0 * vnoise(suv * uRes / (26.0 * uDpr) + 3.0));
   vec2 o = px * wline;
-  float dC = lin(texture(tDepth, suv).x);
-  float dL = lin(texture(tDepth, suv - vec2(o.x, 0.0)).x);
-  float dR = lin(texture(tDepth, suv + vec2(o.x, 0.0)).x);
-  float dD = lin(texture(tDepth, suv - vec2(0.0, o.y)).x);
-  float dU = lin(texture(tDepth, suv + vec2(0.0, o.y)).x);
+  float dC = lin(texture(tDepth, tuv).x);
+  float dL = lin(texture(tDepth, S(tuv - vec2(o.x, 0.0))).x);
+  float dR = lin(texture(tDepth, S(tuv + vec2(o.x, 0.0))).x);
+  float dD = lin(texture(tDepth, S(tuv - vec2(0.0, o.y))).x);
+  float dU = lin(texture(tDepth, S(tuv + vec2(0.0, o.y))).x);
   float iC = 1.0 / dC;
   float lap = (abs(1.0 / dL + 1.0 / dR - 2.0 * iC) + abs(1.0 / dD + 1.0 / dU - 2.0 * iC)) / iC;
   float eD = smoothstep(0.05, 0.2, lap);
-  vec4 nL = texture(tInfo, suv - vec2(o.x, 0.0)), nR = texture(tInfo, suv + vec2(o.x, 0.0));
-  vec4 nD = texture(tInfo, suv - vec2(0.0, o.y)), nU = texture(tInfo, suv + vec2(0.0, o.y));
+  vec4 nL = texture(tInfo, S(tuv - vec2(o.x, 0.0))), nR = texture(tInfo, S(tuv + vec2(o.x, 0.0)));
+  vec4 nD = texture(tInfo, S(tuv - vec2(0.0, o.y))), nU = texture(tInfo, S(tuv + vec2(0.0, o.y)));
   float eI = 0.0;
   eI = max(eI, step(0.004, abs(nL.g - inf.g)) * min(nL.b, inf.b));
   eI = max(eI, step(0.004, abs(nR.g - inf.g)) * min(nR.b, inf.b));
@@ -2270,9 +1831,9 @@ void main(){
 
   // ---- Impasto: paint relief lit by a raking light from the upper left
   float hC = inf.r;
-  float hx = texture(tInfo, suv + vec2(px.x, 0.0)).r - texture(tInfo, suv - vec2(px.x, 0.0)).r;
-  float hy = texture(tInfo, suv + vec2(0.0, px.y)).r - texture(tInfo, suv - vec2(0.0, px.y)).r;
-  float painted = inf.a;
+  float hx = texture(tInfo, S(tuv + vec2(px.x, 0.0))).r - texture(tInfo, S(tuv - vec2(px.x, 0.0))).r;
+  float hy = texture(tInfo, S(tuv + vec2(0.0, px.y))).r - texture(tInfo, S(tuv - vec2(0.0, px.y))).r;
+  float painted = inf.a;   // 1 on the canvas, fading away from it
   float imp = uImpasto * mix(1.0, uPaintImp, painted);
   vec3 n = normalize(vec3(-hx * imp, -hy * imp, 1.0));
   vec3 Ld = normalize(vec3(-0.55, 0.62, 0.56));
@@ -2280,11 +1841,6 @@ void main(){
   float spec = pow(max(dot(reflect(-Ld, n), vec3(0.0, 0.0, 1.0)), 0.0), 16.0);
   col *= 1.0 + diff * 0.8;
   col += spec * uGloss * vec3(1.0, 0.97, 0.9) * smoothstep(0.05, 0.4, hC) * (0.4 + 0.6 * dot(col, vec3(0.33)));
-
-  // ---- Canvas weave, strongest where paint is thin
-  vec2 fp = gl_FragCoord.xy / uDpr;
-  float weave = sin(fp.x * 2.2) * sin(fp.y * 2.2) + 0.5 * sin((fp.x + fp.y) * 0.9);
-  col *= 1.0 + 0.03 * weave * (1.0 - smoothstep(0.1, 0.6, hC)) * (1.0 - painted);
 
   // ---- Ink
   vec3 ink = uInk * (0.7 + 0.6 * vnoise(suv * uRes / (30.0 * uDpr)));
@@ -2294,11 +1850,11 @@ void main(){
   float l = dot(col, vec3(0.299, 0.587, 0.114));
   vec3 graded = mix(vec3(l), col, uSat) * uBright;
   float vg = smoothstep(0.4, 1.25, length((vUv - 0.5) * vec2(aspect, 1.0)) * 1.15);
-  graded = mix(graded, graded * uVigCol, vg * uVig);
-  col = mix(graded, col, painted);
-  // arrival: only Vincent's own frame glows at first, the world around it fades in
-  float inFrameA = step(0.8, painted);
-  col = mix(col, col * 0.07 + vec3(0.01, 0.012, 0.03), (1.0 - inFrameA) * uHideWorld);
+  col = mix(graded, graded * uVigCol, vg * uVig);
+  // arrival: only Vincent's own frame glows at first, then the world spreads out from it
+  float rv = 1.05 * (1.0 - uHideWorld);
+  float vis = smoothstep(0.75 - rv, 0.95 - rv, painted);
+  col = mix(col * 0.07 + vec3(0.01, 0.012, 0.03), col, vis);
   col += (hash12(gl_FragCoord.xy + fract(uTime) * 91.0) - 0.5) * 0.02;
 
   // ---- The silver pool
@@ -2349,7 +1905,7 @@ class Pipeline {
         uInk: { value: C('#0b1640') }, uInkPx: { value: 2.2 }, uImpasto: { value: 1.8 }, uGloss: { value: 0.25 },
         uTrans: { value: 0 }, uSpin: { value: 1 }, uMistTint: { value: C('#8fa6e0') },
         uVig: { value: 0.6 }, uVigCol: { value: C('#6a78a8') }, uSat: { value: 1.08 }, uBright: { value: 1 }, uFadeBlack: { value: 0 }, uBlur: { value: 0 },
-        uPaintImp: { value: 1 }, uHideWorld: { value: 0 },
+        uPaintImp: { value: 1 }, uHideWorld: { value: 0 }, uScale: { value: new THREE.Vector2(1, 1) },
       },
       vertexShader: POST_VS, fragmentShader: POST_FS, depthTest: false, depthWrite: false,
     });
@@ -2380,14 +1936,21 @@ class Pipeline {
     u.uMistTint.value.set(look.mist);
     u.uPaintImp.value = look.paintImpasto ?? 1;
   }
-  render(scene, camera, time, dpr, target = null, rt = this.rt) {
+  // scale < 1 renders the scene into the lower-left part of the targets: the resolution can
+  // change every frame without reallocating anything
+  render(scene, camera, time, dpr, target = null, rt = this.rt, scale = 1) {
     const r = this.renderer;
+    const w = Math.max(2, Math.round(rt.width * scale)), h = Math.max(2, Math.round(rt.height * scale));
+    rt.viewport.set(0, 0, w, h);
+    rt.scissor.set(0, 0, w, h);
+    rt.scissorTest = w < rt.width || h < rt.height;
     r.setRenderTarget(rt);
     r.clear(true, true, true);
     r.render(scene, camera);
     const u = this.mat.uniforms;
     u.tColor.value = rt.textures[0]; u.tInfo.value = rt.textures[1]; u.tDepth.value = rt.depthTexture;
     u.uRes.value.set(rt.width, rt.height); u.uDpr.value = dpr; u.uTime.value = time;
+    u.uScale.value.set(w / rt.width, h / rt.height);
     u.uNear.value = camera.near; u.uFar.value = camera.far;
     r.setRenderTarget(target);
     r.render(this.quadScene, this.quadCam);
@@ -2411,7 +1974,9 @@ class Player {
     this.dragging = false;
     this.enabled = false;
     this.jumpY = 0; this.jumpV = 0;
-    this.bob = 0;
+    this.phase = 0;   // stride: one footfall every pi
+    this.head = V3(); // where the head rides relative to the body: footfalls, sway, breathing
+    this.time = 0;
     this.moved = 0;
     this.stick = { x: 0, y: 0 };
     this.sens = 0.0022;
@@ -2472,7 +2037,7 @@ class Player {
     this.pitch = clamp(this.pitch - dy * this.sens, -1.35, 1.35);
   }
   setStick(x, y) { this.stick.x = x; this.stick.y = y; }
-  place(p, yaw, pitch) { this.pos.copy(p); this.yaw = yaw; this.pitch = pitch; this.vel.set(0, 0, 0); this.jumpY = 0; this.jumpV = 0; }
+  place(p, yaw, pitch) { this.pos.copy(p); this.yaw = yaw; this.pitch = pitch; this.vel.set(0, 0, 0); this.jumpY = 0; this.jumpV = 0; this.head.set(0, 0, 0); }
   update(dt, world) {
     const k = this.keys;
     let fx = 0, fz = 0;
@@ -2497,18 +2062,33 @@ class Player {
     world.constrain(this.pos);
     const sp = Math.hypot(this.vel.x, this.vel.z);
     this.moved += sp * dt;
-    this.bob += sp * dt * 1.9;
+    this.time += dt;
+    // Footfalls come from the distance actually walked, so they keep time with what you see. The head dips
+    // as each foot lands and sways toward the foot it stands on; standing still, it barely breathes.
+    const pace = clamp(sp / 3.4, 0, 1.4);
+    const prev = this.phase;
+    this.phase += sp * dt / (run ? 0.95 : 0.72) * Math.PI;
+    const airborne = this.jumpY > 0.001;
+    if (!airborne && sp > 0.5 && Math.floor(this.phase / Math.PI) !== Math.floor(prev / Math.PI)) this.onStep?.('step', pace, Math.floor(this.phase / Math.PI) & 1);
     this.jumpV -= 12 * dt;
+    const wasUp = airborne;
+    const fall = this.jumpV;
     this.jumpY = Math.max(0, this.jumpY + this.jumpV * dt);
-    if (this.jumpY <= 0) this.jumpV = Math.max(this.jumpV, 0);
-    const ground = world.ground(this.pos.x, this.pos.z);
-    const bobY = Math.sin(this.bob * 2) * 0.035 * clamp(sp / 3.4, 0, 1.3);
-    this.pos.y = ground + world.eye + this.jumpY + bobY;
+    if (this.jumpY <= 0) { if (wasUp) this.onStep?.('land', clamp(-fall / 4, 0.5, 1.6), 0); this.jumpV = Math.max(this.jumpV, 0); }
+    const still = 1 - smooth(0.1, 0.8, sp);
+    this.head.set(
+      Math.sin(this.phase) * 0.012 * pace,
+      -0.5 * Math.cos(2 * this.phase) * (run ? 0.06 : 0.04) * pace + Math.sin(this.time * 1.25) * 0.006 * still,
+      0,
+    );
+    this.pos.y = world.ground(this.pos.x, this.pos.z) + world.eye + this.jumpY;
     return sp;
   }
   apply(cam) {
-    cam.position.copy(this.pos);
-    cam.rotation.set(this.pitch, this.yaw, 0, 'YXZ');
+    // the sway is sideways to where you face; it moves the eye, not the body
+    const c = Math.cos(this.yaw), s = Math.sin(this.yaw);
+    cam.position.set(this.pos.x + c * this.head.x, this.pos.y + this.head.y, this.pos.z - s * this.head.x);
+    cam.rotation.set(this.pitch + Math.sin(this.time * 0.9) * 0.002 * (1 - smooth(0.1, 0.8, Math.hypot(this.vel.x, this.vel.z))), this.yaw, 0, 'YXZ');
   }
 }
 
@@ -2588,11 +2168,6 @@ async function loadCanvasAssets(key, parts) {
     if (p === 'hulls') jobs.hulls = loadPixels(`${key}-hulls.png`);
     if (p === 'wallTex') jobs.wallTex = loadTex(`${key}-wall.jpg`);
     if (p === 'floorTex') jobs.floorTex = loadTex(`${key}-floor.jpg`);
-    if (p === 'pano') {
-      jobs.pano = loadTex(`${key}-pano.jpg`);
-      jobs.panoLab = loadTex(`${key}-pano-lab.png`);
-      jobs.panoFlow = loadTex(`${key}-pano-flow.png`, { mips: false });
-    }
   }
   const keys = Object.keys(jobs);
   const vals = await Promise.all(keys.map((k) => jobs[k]));
@@ -2630,23 +2205,19 @@ class Canvas {
       uPaintPx: { value: new THREE.Vector2(o.meta.size[0], o.meta.size[1]) },
       uFlowAmt: { value: o.flowAmt ?? 0 }, uFlowRate: { value: o.flowRate ?? 0.3 },
       uRelief: { value: o.relief ?? 1.6 }, uDetail: { value: 1 },
-      uMirrorSky: { value: o.mirrorSky ?? 0.05 }, uMirrorLand: { value: o.mirrorLand ?? 0.12 },
-      uExtAng: { value: new THREE.Vector2(Math.atan(this.t * this.aspect), Math.atan(this.t)) },
-      uExtWarp: { value: o.extWarp ?? 1.0 },
-      uC0YawPitch: { value: new THREE.Vector2(o.yaw, o.pitch) },
       uShimmer: { value: o.shimmer ?? 0 }, uDiscardFar: { value: o.discardFar ?? 200 }, uCurrents: { value: o.currents ?? 0 },
-      uBands: { value: new THREE.Vector2(o.skyBand ?? 0.6, o.landBand ?? 0.3) },
       uExtNear: { value: new THREE.Vector2(...(o.extNear || [24, 60])) },
+      uAspect: { value: this.aspect }, uBand: { value: o.band ?? 0.09 },
+      uExtAng: { value: new THREE.Vector2(Math.atan(this.t * this.aspect), Math.atan(this.t)) },
+      uC0YawPitch: { value: new THREE.Vector2(o.yaw, o.pitch) },
+      // filled in by buildExtension()
+      uPlateSky: { value: BLACK_TEX }, uPlateLand: { value: BLACK_TEX }, uGradSky: { value: BLACK_TEX }, uGradLand: { value: BLACK_TEX },
+      uCand: { value: BLACK_TEX }, uCandN: { value: new THREE.Vector2(1, 1) },
+      uPatch: { value: o.patch ?? 0.09 }, uHF: { value: o.brushwork ?? 1 }, uExtLodMax: { value: o.extLodMax ?? 6.5 }, uFarDev: { value: o.farDev ?? 1 },
+      uStars: { value: Array.from({ length: 24 }, () => new THREE.Vector4()) }, uStarN: { value: 0 }, uStarCfg: { value: new THREE.Vector3(0.3, 0, 12) },
+      uHoriz: { value: BLACK_TEX }, uHorizOn: { value: 0 },
     };
-  }
-  attachPano(tex, meta, flowAmt) {
-    for (const t of [tex.pano, tex.panoLab, tex.panoFlow]) { t.wrapS = THREE.RepeatWrapping; t.needsUpdate = true; }
-    this.pano = {
-      uPanoOn: { value: 1 }, uPano: { value: tex.pano }, uPanoLab: { value: tex.panoLab }, uPanoFlow: { value: tex.panoFlow },
-      uPanoEl: { value: new THREE.Vector2(meta.elMin, meta.elMax) },
-      uPanoPx: { value: new THREE.Vector2(meta.size[0], meta.size[1]) },
-      uPanoFlowAmt: { value: flowAmt },
-    };
+    this.horizon = () => -90;
   }
   // world-space ray through painting coordinates (u right, v down, both 0..1)
   dir(u, v) {
@@ -2656,24 +2227,277 @@ class Canvas {
   at(u, v, z) {
     return V3((2 * u - 1) * this.t * this.aspect * z, (1 - 2 * v) * this.t * z, -z).applyMatrix4(this.cam.matrixWorld);
   }
-  // extended-canvas coordinates for a world direction (no warp), mirrors the GLSL extUV
-  extUV(d, landShear) {
-    const ax = Math.atan(this.t * this.aspect), ay = Math.atan(this.t);
-    let az = Math.atan2(d.x, -d.z) - this.yaw;
-    az = Math.atan2(Math.sin(az), Math.cos(az));
-    const el = Math.asin(clamp(d.y, -1, 1)) - this.pitch;
-    const tile = (Math.PI - ax) / 2.5;
-    let u = 0.5 + az / (2 * ax);
-    if (az > ax) u = 1 + (az - ax) / tile; else if (az < -ax) u = -(-ax - az) / tile;
-    let vg = 0.5 + el / (2 * ay);   // GL convention (up), matching the shader
-    const ho = Math.max(-u, u - 1);
-    if (ho > 0) vg += (landShear ?? 0.18) * (u > 1 ? 1 : -1) * Math.min(ho, 0.6);
-    if (u > 1) u = 1 + (u - 1) * 1.4; else if (u < 0) u *= 1.4;
-    const tri = (x) => Math.abs(x - 2 * Math.floor(x * 0.5 + 0.5));
-    return [tri(u), 1 - tri(vg), u, 1 - vg];
-  }
   azEl(u, v) { const d = this.dir(u, v); return [Math.atan2(d.x, -d.z) / DEG, Math.asin(clamp(d.y, -1, 1)) / DEG]; }
   project(p) { const q = p.clone().project(this.cam); return [q.x * 0.5 + 0.5, 0.5 - q.y * 0.5, p.clone().applyMatrix4(this.cam.matrixWorldInverse).z * -1]; }
+
+  // The far skyline seen from the painter, all the way round: the painted one between the frame edges
+  // (pts: [u, v] with v down), and outside them a gentle ridge that both edges hand over to.
+  // Sets the sky's horizon and returns elevation(azimuth) in degrees for building geometry under it.
+  setHorizon(pts, o = {}) {
+    const yawD = this.yaw / DEG;
+    const prof = pts.map(([u, v]) => this.azEl(u, v)).map(([az, el]) => [az - yawD, el]).sort((a, b) => a[0] - b[0]);
+    const a0 = prof[0][0], a1 = prof[prof.length - 1][0];
+    const mean = o.mean ?? prof.reduce((s, p) => s + p[1], 0) / prof.length;
+    const amp = o.amp ?? 1.2, seed = o.seed ?? 3, reach = o.reach ?? 30;
+    const proc = (a) => {
+      const r = a * DEG;
+      return mean + amp * (0.5 * Math.sin(r * 3 + seed) + 0.3 * Math.sin(r * 7 + seed * 2.3) + 1.6 * (jfbm(Math.cos(r) * 1.6 + seed, Math.sin(r) * 1.6, 3) - 0.5));
+    };
+    const offL = prof[0][1] - proc(a0), offR = prof[prof.length - 1][1] - proc(a1);
+    const inside = (a) => {
+      let lo = 0, hi = prof.length - 1;
+      while (hi - lo > 1) { const m = (lo + hi) >> 1; if (prof[m][0] <= a) lo = m; else hi = m; }
+      return lerp(prof[lo][1], prof[hi][1], clamp((a - prof[lo][0]) / Math.max(1e-6, prof[hi][0] - prof[lo][0]), 0, 1));
+    };
+    const rel = (a) => {
+      a = ((a + 180) % 360 + 360) % 360 - 180;
+      if (a >= a0 && a <= a1) return inside(a);
+      const dl = a < a0 ? a0 - a : a0 + 360 - a, dr = a > a1 ? a - a1 : a + 360 - a1;
+      return proc(a) + offL * (1 - smooth(0, reach, dl)) + offR * (1 - smooth(0, reach, dr));
+    };
+    const N = 1024;
+    const data = new Uint16Array(N * 4);
+    for (let i = 0; i < N; i++) data[i * 4] = THREE.DataUtils.toHalfFloat(rel((i + 0.5) / N * 360 - 180));
+    const t = new THREE.DataTexture(data, N, 1, THREE.RGBAFormat, THREE.HalfFloatType);
+    t.wrapS = THREE.RepeatWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+    t.minFilter = t.magFilter = THREE.LinearFilter; t.generateMipmaps = false; t.needsUpdate = true;
+    this.uniforms.uHoriz.value = t; this.uniforms.uHorizOn.value = 1;
+    const table = new Float32Array(3601);
+    for (let i = 0; i <= 3600; i++) table[i] = rel(i / 10 - 180);
+    this.horizon = (azWorldDeg) => {
+      const a = ((azWorldDeg - yawD + 180) % 360 + 360) % 360 * 10, i = Math.min(3599, Math.floor(a));
+      return lerp(table[i], table[i + 1], a - i);
+    };
+    return this.horizon;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The data the shaders use to continue the canvas past its frame (see GL_EXT),
+// measured once from a 512-pixel-wide reading of the painting and its labels.
+// ---------------------------------------------------------------------------
+const READ_FS = /* glsl */`
+uniform sampler2D tSrc; uniform float uLod;
+in vec2 vUv;
+layout(location = 0) out vec4 outColor;
+void main(){ outColor = textureLod(tSrc, vUv, uLod); }`;
+// Raw bytes of a texture resampled to w x h (rows bottom-up, v up like the shaders).
+function readTex(tex, w, h, lod = 0) {
+  const rt = new THREE.WebGLRenderTarget(w, h, { depthBuffer: false });
+  const mat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3, uniforms: { tSrc: { value: tex }, uLod: { value: lod } },
+    vertexShader: POST_VS, fragmentShader: READ_FS, depthTest: false, depthWrite: false,
+  });
+  const tri = new THREE.BufferGeometry();
+  tri.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
+  const sc = new THREE.Scene();
+  const mesh = new THREE.Mesh(tri, mat); mesh.frustumCulled = false; sc.add(mesh);
+  const prev = renderer.getRenderTarget();
+  renderer.setRenderTarget(rt);
+  renderer.render(sc, new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1));
+  const px = new Uint8Array(w * h * 4);
+  renderer.readRenderTargetPixels(rt, 0, 0, w, h, px);
+  renderer.setRenderTarget(prev);
+  rt.dispose(); mat.dispose(); tri.dispose();
+  return px;
+}
+function dataTex(data, w, h, { mips = false, float = false } = {}) {
+  const t = new THREE.DataTexture(data, w, h, THREE.RGBAFormat, float ? THREE.FloatType : THREE.UnsignedByteType);
+  t.colorSpace = THREE.NoColorSpace;
+  t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  t.generateMipmaps = mips;
+  t.minFilter = float ? THREE.NearestFilter : (mips ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter);
+  t.magFilter = float ? THREE.NearestFilter : THREE.LinearFilter;
+  t.needsUpdate = true;
+  return t;
+}
+
+// average colour (0..1) of an exemplar: a stretch of the painting's land, or a texture of its own
+function exemplarMean(canvas, ex) {
+  if (!ex) return [0, 0, 0];
+  if (ex.tex) { const p = readTex(ex.tex, 1, 1, 12); return [p[0] / 255, p[1] / 255, p[2] / 255]; }
+  const { paint, wl, PW, PH } = canvas.ext;
+  const [u0, v0, u1, v1] = ex.rect;
+  let r = 0, g = 0, b = 0, a = 0;
+  for (let j = Math.floor(v0 * PH); j < Math.ceil(v1 * PH); j++) for (let i = Math.floor(u0 * PW); i < Math.ceil(u1 * PW); i++) {
+    const k = j * PW + i, w = wl[k];
+    r += paint[k * 4] * w; g += paint[k * 4 + 1] * w; b += paint[k * 4 + 2] * w; a += w;
+  }
+  return a > 0 ? [r / a / 255, g / a / 255, b / a / 255] : [0.5, 0.5, 0.5];
+}
+
+async function buildExtension(canvas, tex, o = {}) {
+  const PW = 512, PH = Math.round(PW / canvas.aspect), n = PW * PH;
+  const lod = Math.log2(canvas.meta.size[0] / PW);
+  const paint = readTex(tex.paint, PW, PH, lod);
+  const lab = readTex(tex.labels, PW, PH, lod);
+  const halo = tex.halo ? readTex(tex.halo, PW, PH, 0) : null;
+  await breathe();
+
+  // Which pixels belong to the sky and to the land (without the objects in front). The sky's stars are left
+  // out so they don't smear past the frame, except a glow cut by the frame edge (the moon), which carries on.
+  const hv = new Float32Array(n), edgeGlow = new Uint8Array(n);
+  for (let i = 0; i < n; i++) hv[i] = halo ? halo[i * 4] / 255 : 0;
+  for (let i = 0; i < n; i++) {
+    if (edgeGlow[i] || hv[i] < 0.03) continue;
+    const x0 = i % PW, y0 = (i / PW) | 0;
+    if (x0 > 0 && y0 > 0 && x0 < PW - 1 && y0 < PH - 1) continue;
+    const stack = [i]; edgeGlow[i] = 1;
+    while (stack.length) {
+      const k = stack.pop(), x = k % PW, y = (k / PW) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const xx = x + dx, yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= PW || yy >= PH) continue;
+        const kk = yy * PW + xx;
+        if (!edgeGlow[kk] && hv[kk] >= 0.03) { edgeGlow[kk] = 1; stack.push(kk); }
+      }
+    }
+  }
+  const ws = new Float32Array(n), wc = new Float32Array(n), wl = new Float32Array(n);
+  const rim = Math.ceil(0.012 * PW);   // the scan's own border is paler than the paint: leave it out
+  for (let i = 0; i < n; i++) {
+    const x = i % PW, y = (i / PW) | 0;
+    if (x < rim || y < rim || x >= PW - rim || y >= PH - rim) continue;
+    const R = lab[i * 4] / 255, G = lab[i * 4 + 1] / 255, B = lab[i * 4 + 2] / 255;
+    const sky = smooth(0.6, 0.95, (1 - R) * (1 - G) * (1 - B)), clear = 1 - smooth(0.03, 0.25, hv[i]);
+    ws[i] = edgeGlow[i] ? sky * (0.35 + 0.65 * clear) : sky * clear;
+    wc[i] = sky * clear;
+    wl[i] = smooth(0.6, 0.95, R * (1 - G) * (1 - B));
+  }
+  const plate = (w) => {
+    const d = new Uint8Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      for (let k = 0; k < 3; k++) d[i * 4 + k] = Math.round(paint[i * 4 + k] * w[i]);
+      d[i * 4 + 3] = Math.round(w[i] * 255);
+    }
+    return dataTex(d, PW, PH, { mips: true });
+  };
+  // average colour of each row of a layer, for the left and the right half of the canvas (x = 0, 1);
+  // rows without the layer borrow from the nearest rows that have it
+  const half = (w, side) => {
+    const sum = new Float64Array(PH * 4);
+    for (let j = 0; j < PH; j++) for (let i = side * PW / 2; i < (side + 1) * PW / 2; i++) {
+      const k = j * PW + i, a = w[k];
+      sum[j * 4] += paint[k * 4] * a; sum[j * 4 + 1] += paint[k * 4 + 1] * a; sum[j * 4 + 2] += paint[k * 4 + 2] * a; sum[j * 4 + 3] += a;
+    }
+    const rows = [];
+    for (let j = 0; j < PH; j++) if (sum[j * 4 + 3] > 3) rows.push(j);
+    const col = new Float32Array(PH * 3);
+    for (let j = 0; j < PH; j++) {
+      if (!rows.length) continue;
+      let lo = rows[0], hi = rows[rows.length - 1];
+      for (const r of rows) { if (r <= j) lo = r; if (r >= j) { hi = r; break; } }
+      if (j < rows[0]) lo = hi = rows[0];
+      if (j > rows[rows.length - 1]) lo = hi = rows[rows.length - 1];
+      const t = hi === lo ? 0 : (j - lo) / (hi - lo);
+      for (let k = 0; k < 3; k++) col[j * 3 + k] = lerp(sum[lo * 4 + k] / sum[lo * 4 + 3], sum[hi * 4 + k] / sum[hi * 4 + 3], t);
+    }
+    const out = new Float32Array(PH * 3);
+    for (let j = 0; j < PH; j++) {
+      for (let d = -4; d <= 4; d++) { const jj = clamp(j + d, 0, PH - 1); for (let k = 0; k < 3; k++) out[j * 3 + k] += col[jj * 3 + k] / 9; }
+    }
+    return { rows, out };
+  };
+  const gradient = (w) => {
+    const L = half(w, 0), R = half(w, 1);
+    // a half without the layer at all uses the other half
+    const l = L.rows.length ? L.out : R.out, r = R.rows.length ? R.out : L.out;
+    const data = new Uint8Array(PH * 2 * 4);
+    for (let j = 0; j < PH; j++) for (let k = 0; k < 3; k++) {
+      data[(j * 2) * 4 + k] = Math.round(l[j * 3 + k]);
+      data[(j * 2 + 1) * 4 + k] = Math.round(r[j * 3 + k]);
+      data[(j * 2) * 4 + 3] = data[(j * 2 + 1) * 4 + 3] = 255;
+    }
+    return dataTex(data, 2, PH);
+  };
+
+  // Patch centres for the borrowed brushwork: for each horizontal band of each half of the canvas, spots whose
+  // whole patch lies in the layer (relaxed in narrow bands; empty bands borrow from the other half, then
+  // from their neighbours).
+  const NB = 16, K = 32;
+  const cand = new Float32Array(K * NB * 4 * 4);
+  const rng = mulberry(o.seed ?? 11);
+  const at = (w, x, y) => w[clamp(Math.round(y), 0, PH - 1) * PW + clamp(Math.round(x), 0, PW - 1)];
+  const rpx = (canvas.uniforms.uPatch.value * 0.5) * PH;
+  const fits = (w, x, y, r) => {
+    if (x - r < 0 || x + r > PW - 1 || y - r < 0 || y + r > PH - 1 || at(w, x, y) < 0.9) return false;
+    for (let k = 0; k < 12; k++) {
+      const a = k / 12 * TAU, c = Math.cos(a), s = Math.sin(a);
+      if (at(w, x + c * r, y + s * r) < 0.9 || at(w, x + c * r * 0.5, y + s * r * 0.5) < 0.9) return false;
+    }
+    return true;
+  };
+  [wc, wl].forEach((w, layer) => {
+    const found = [[], []];
+    for (let side = 0; side < 2; side++) for (let b = 0; b < NB; b++) {
+      // relax the fit and widen the band until there are enough different patches not to repeat
+      const list = [];
+      const margin = 0.02 * PH;   // the scan's own border is not paint
+      for (const [rr, spread] of [[1, 0], [0.7, 0], [0.7, 1], [0.5, 1], [0.5, 2], [0.35, 3], [0.25, 5]]) {
+        const y0 = clamp((b - spread) / NB, 0, 1) * PH, y1 = clamp((b + 1 + spread) / NB, 0, 1) * PH;
+        for (let t = 0; t < 400 && list.length < K; t++) {
+          const x = (side + rng()) * 0.5 * PW, y = y0 + rng() * (y1 - y0);
+          if (x < margin || y < margin || x > PW - margin || y > PH - margin) continue;
+          if (fits(w, x, y, rpx * rr)) list.push([(x + 0.5) / PW, (y + 0.5) / PH]);
+        }
+        if (list.length >= K) break;
+      }
+      found[side].push(list);
+    }
+    for (let side = 0; side < 2; side++) for (let b = 0; b < NB; b++) {
+      let list = found[side][b].length ? found[side][b] : found[1 - side][b];
+      for (let d = 1; !list.length && d < NB; d++) {
+        for (const f of [found[side][b - d], found[side][b + d], found[1 - side][b - d], found[1 - side][b + d]]) {
+          if (f && f.length) { list = f; break; }
+        }
+      }
+      if (!list.length) list = [[0.5, 0.5]];
+      for (let k = 0; k < K; k++) {
+        const c = list[k % list.length], off = (((layer * 2 + side) * NB + b) * K + k) * 4;
+        cand[off] = c[0]; cand[off + 1] = c[1];
+      }
+    }
+  });
+
+  await breathe();
+  // his stars, found as discs in the halo map (the moon, the brightest, is left alone)
+  const stars = [];
+  if (halo) {
+    const seen = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      if (seen[i] || hv[i] < 0.3) continue;
+      const stack = [i]; seen[i] = 1;
+      let cnt = 0, sx = 0, sy = 0, mx = 0;
+      while (stack.length) {
+        const k = stack.pop(), x = k % PW, y = (k / PW) | 0;
+        cnt++; sx += x; sy += y; mx = Math.max(mx, hv[k]);
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= PW || yy >= PH) continue;
+          const kk = yy * PW + xx;
+          if (!seen[kk] && hv[kk] >= 0.3) { seen[kk] = 1; stack.push(kk); }
+        }
+      }
+      const r = Math.sqrt(cnt / Math.PI), cx = sx / cnt, cy = sy / cnt;
+      if (mx > 0.8 || r < 2 || cx - r < 1 || cy - r < 1 || cx + r > PW - 2 || cy + r > PH - 2) continue;
+      stars.push([(cx + 0.5) / PW, (cy + 0.5) / PH, (r / PH) * 1.25]);
+    }
+  }
+  canvas.ext = { paint, wl, PW, PH };
+  const U = canvas.uniforms;
+  U.uPlateSky.value = plate(ws); U.uPlateLand.value = plate(wl);
+  U.uGradSky.value = gradient(ws); U.uGradLand.value = gradient(wl);
+  U.uCand.value = dataTex(cand, K, NB * 4, { float: true }); U.uCandN.value.set(K, NB);
+  const use = stars.slice(0, 24);
+  use.forEach((s, i) => U.uStars.value[i].set(s[0], s[1], s[2], 0));
+  U.uStarN.value = use.length;
+  if (use.length) {
+    const ay = Math.atan(canvas.t), ax = Math.atan(canvas.t * canvas.aspect);
+    const rMax = Math.max(...use.map((s) => s[2])) * 2 * ay * 1.15;
+    const cell = Math.max(5 * rMax, o.starCell ?? 0.12);
+    const density = (stars.length / (4 * ax * ay)) * cell * cell * (o.starDensity ?? 0.8);
+    U.uStarCfg.value.set(cell, clamp(density, 0.08, 0.7), o.starMinEl ?? 12);
+  }
 }
 
 // A silhouette from the canvas given volume: two sheets along the painter's rays,
@@ -2728,8 +2552,10 @@ function inflatedGeometry(canvas, map, o) {
 
 // A flat, slightly thickened cut-out standing on the painter's rays at a given depth
 // (used for thin painted objects such as a spire that must rise above the terrain).
-function canvasCard(canvas, poly, depth, thickness = 1) {
-  const shape = new THREE.Shape(poly.map(([u, v]) => new THREE.Vector2(u, -v)));
+// `extend` pushes the outline past any frame edge that crops it, so the object carries on beyond the frame.
+function canvasCard(canvas, poly, depth, thickness = 1, extend = 0) {
+  const out = (x) => (x < 0.015 ? x - extend : x > 0.985 ? x + extend : x);
+  const shape = new THREE.Shape(poly.map(([u, v]) => new THREE.Vector2(out(u), -out(v))));
   const g = new THREE.ExtrudeGeometry(shape, { depth: 1, bevelEnabled: false, steps: 1 });
   const p = g.attributes.position;
   for (let i = 0; i < p.count; i++) {
@@ -2824,46 +2650,17 @@ async function buildStarry() {
   const EYE = 30;
   const canvas = S.canvas = new Canvas({
     meta, tex, fov: 56, pos: V3(0, EYE, 0), yaw: 0, pitch: 12 * DEG,
-    flowAmt: 30, flowRate: 0.36, relief: 1.6, skyBand: 0.62, landBand: 0.28, currents: 0.62,
+    flowAmt: 30, flowRate: 0.36, relief: 1.6, currents: 0.62, patch: 0.1, extLodMax: 7.5,
   });
+  await buildExtension(canvas, tex, { seed: 5 });
   S.fov = 56;
   const env = S.env = new Env({ keyDir: [0.5, 0.62, 0.5], key: 0.52, amb: 0.17, wrap: 0.55, fogCol: '#2c4a9c', fogNear: 400, fogFar: 3200 });
   S.far = 9000;
-  S.look = { ink: '#0a1438', inkPx: 2.0, impasto: 1.7, gloss: 0.26, sat: 1.06, bright: 1.0, vig: 0.45, vigCol: '#4e5c90', mist: '#7f9be0', paintImpasto: 0.9 };
+  S.look = { ink: '#0a1438', inkPx: 2.0, impasto: 1.7, gloss: 0.26, sat: 1.02, bright: 1.0, vig: 0.4, vigCol: '#4e5c90', mist: '#7f9be0', paintImpasto: 0.9 };
 
-  // ---- The ridge Vincent painted, as elevation angles seen from his eye
-  // The ridge Vincent painted, continued with rolling hills all the way round
-  const ridge = meta.ridge.map(([u, v]) => canvas.azEl(u, v)).sort((a, b) => a[0] - b[0]);
-  const az0 = ridge[0][0], az1 = ridge[ridge.length - 1][0];
-  const procRidge = (az) => {
-    const a = az * DEG;
-    return 2.6 + 1.8 * Math.sin(a * 3 + 0.7) + 1.2 * Math.sin(a * 7 + 2.0) + 2.2 * Math.max(0, Math.sin(a * 5 - 1.1) - 0.5) + 1.4 * (jfbm(Math.cos(a) * 2 + 5, Math.sin(a) * 2 + 1, 3) - 0.5);
-  };
-  const ridgeU = meta.ridge.map(([u, v]) => [u, v]);
-  const vRidgeAt = (u) => {
-    let lo = 0, hi = ridgeU.length - 1;
-    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (ridgeU[m][0] <= u) lo = m; else hi = m; }
-    const t = clamp((u - ridgeU[lo][0]) / Math.max(1e-6, ridgeU[hi][0] - ridgeU[lo][0]), 0, 1);
-    return lerp(ridgeU[lo][1], ridgeU[hi][1], t);
-  };
-  // elevation of the reflected ridge seen along world azimuth az (searched along the vertical)
-  const ay = Math.atan(canvas.t);
-  const mirroredRidge = (az) => {
-    const d = dirAzEl(az, 0);
-    const [um, , u] = canvas.extUV(d, 0.18);
-    const vr = vRidgeAt(um);
-    const ho = Math.max(-u, u - 1) / 1.4;   // extUV returns the stretched coordinate
-    const shear = ho > 0 ? 0.18 * (u > 1 ? 1 : -1) * Math.min(ho, 0.6) : 0;
-    return ((1 - vr) - 0.5 - shear) * 2 * ay / DEG + canvas.pitch / DEG;
-  };
-  const ridgeEl = (az) => {
-    if (az <= az0) return lerp(ridge[0][1], mirroredRidge(az), smooth(0, 6, az0 - az));
-    if (az >= az1) return lerp(ridge[ridge.length - 1][1], mirroredRidge(az), smooth(0, 6, az - az1));
-    let lo = 0, hi = ridge.length - 1;
-    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (ridge[m][0] <= az) lo = m; else hi = m; }
-    const t = (az - ridge[lo][0]) / Math.max(1e-6, ridge[hi][0] - ridge[lo][0]);
-    return lerp(ridge[lo][1], ridge[hi][1], t);
-  };
+  // ---- The ridge Vincent painted, continued as rolling hills all the way round. The sky draws the
+  // skyline itself; the terrain stays just under it, so the horizon never steps at the frame edge.
+  const ridgeEl = canvas.setHorizon(meta.ridge, { amp: 1.6, seed: 4 });
   const G0 = EYE - 1.65;
   const height = (x, z) => {
     const r = Math.hypot(x, z);
@@ -2871,73 +2668,23 @@ async function buildStarry() {
     const fs = smooth(Math.cos(100 * DEG), Math.cos(52 * DEG), cf);
     const back = G0 - Math.max(0, r - 10) * 0.035 + 1.3 * (jfbm(x * 0.03 + 4, z * 0.03, 3) - 0.5) * smooth(6, 22, r);
     const front = r < 2 ? G0 : G0 - (r - 2) * 0.34 + 0.5 * (jfbm(x * 0.05, z * 0.05, 2) - 0.5) * smooth(4, 12, r);
-    let h = lerp(back, front, fs);
-    const az = Math.atan2(x, -z) / DEG;
-    const e = ridgeEl(az) + 0.35;
+    const h = lerp(back, front, fs);
     const floorEl = Math.atan2(-EYE, Math.max(r, 1)) / DEG;
-    const el = lerp(floorEl, e, smooth(420, 2300, r));
+    const el = r > 420 ? lerp(floorEl, ridgeEl(Math.atan2(x, -z) / DEG) - 0.5, smooth(420, 2300, r)) : floorEl;
     const far = EYE + r * Math.tan(el * DEG) + 2.4 * (jfbm(x * 0.004, z * 0.004, 3) - 0.5) * smooth(140, 320, r);
     return Math.max(h, far);
   };
   S.ground = height;
   S.bounds = { type: 'circle', x: 0, z: -6, r: 40 };
 
-  // keep procedural props out of the painter's frame so his view stays untouched
-  const outOfFrame = (p, m = 0.04) => { const [u, v, z] = canvas.project(p); return z < 0 || u < -m || u > 1 + m || v < -m || v > 1 + m; };
+  S.add(skyMesh(env, { canvas }));
 
-  // Regions for grass: nothing in front of the painter, meadow + moonlit wheat behind
-  const region = makeRegionTexture(384, { x0: -500, z0: -500, size: 1000 }, (x, z) => {
-    const h = height(x, z);
-    const r = Math.hypot(x, z), az = Math.abs(Math.atan2(x, -z) / DEG);
-    const front = (az < 44 && r < 220) ? 0 : 1;
-    const wheat = smooth(40, 60, z + 10 * Math.sin(x * 0.03)) * smooth(260, 230, z) * smooth(200, 170, Math.abs(x));
-    const grass = front * (1 - wheat) * 0.85;
-    return [h, grass, wheat * front, 0];
-  });
-
-  // ---- Sky: the canvas in frame, Vincent-style brushwork everywhere else
-  const starsAE = meta.stars.map(([u, v, r]) => {
-    const [az, el] = canvas.azEl(u, v);
-    const [az2, el2] = canvas.azEl(u + r, v);
-    const rad = Math.hypot(az2 - az, el2 - el) * 0.95;
-    return [az, el, rad, 1.0];
-  });
-  const [maz, mel] = canvas.azEl(meta.moon[0], meta.moon[1]);
-  const [maz2, mel2] = canvas.azEl(meta.moon[0] + meta.moon[2], meta.moon[1]);
-  const moonHalo = Math.hypot(maz2 - maz, mel2 - mel);
-  S.add(skyMesh(env, {
-    canvas,
-    cell: 0.0165, len: 0.86, wid: 0.27,
-    sky: ['#0b1a4f', '#15328a', '#2455b0', '#4d85c6', '#9fc2dc', '#e2ead0'],
-    glow: ['#8a9a55', '#c9b048', '#efcc3a', '#f5dd62', '#faeea0', '#fffbe6'],
-    moonRamp: ['#b8581c', '#d9792a', '#eb9a35', '#f3bc45', '#f8d86a', '#fff0a8'],
-    horizonV: 0.66, zenithV: 0.24, band: 0.06, arm: 0.66, mottle: 0.12, starStyle: 0, coreK: 0.26, windSpeed: 0.09,
-    vortices: [
-      [64, 24, 11, 0.9], [-58, 30, 9, -0.8], [110, 34, 14, 1.0], [-118, 26, 12, -1.0], [178, 50, 16, 0.8],
-      [150, 18, 9, -0.7], [-160, 40, 12, 0.8], [0, 88, 18, 0.7],
-    ],
-    stars: [
-      ...starsAE,
-      [74, 42, 4.0, 1.0], [96, 22, 3.4, 0.95], [128, 44, 4.2, 1.05], [161, 26, 3.6, 0.95], [-72, 46, 3.8, 1.0],
-      [-96, 20, 3.3, 0.9], [-138, 36, 4.0, 1.0], [-176, 18, 3.2, 0.9], [200, 55, 3.4, 0.95], [40, 62, 3.6, 0.95],
-      [-30, 64, 3.4, 0.9], [140, 70, 3.0, 0.85],
-    ].slice(0, 24),
-    moon: [maz, mel, moonHalo, moonHalo * 0.36],
-  }));
-
-  // ---- Land: valley, village, hills (layer 1)
-  const tmat = groundMaterial(env, {
+  // ---- Land: valley, village, hills (layer 1). Underfoot, brushwork from the dark slope at the lower left.
+  await breathe();
+  S.add(new THREE.Mesh(terrainGeometry(height, 5200, 340, { x: 0, z: 0 }, 0.08), groundMaterial(env, {
     canvas, layer: 1,
-    base: ['#0a1330', '#112447', '#1a3857', '#264f60', '#3b6a69', '#6f9a8c'],
-    zoneA: ['#2b3450', '#5a5a4a', '#8c7a3e', '#b89a45', '#d8bd5c', '#f0dc8a'],
-    zoneB: ['#1d2340', '#3a3e5c', '#5f6178', '#8a8a8f', '#b3ad98', '#d8d0b0'],
-    field: ['#10233a', '#1f4048', '#39624f', '#5c8656', '#8eab66', '#c3cf8c'],
-    region, regionRect: region.userData.rect,
-    cell: 0.4, len: 0.88, wid: 0.3, accent: ['#6f9ad0', '#a58a3a'], accentAmt: 0.08, dirAng: 0.3,
-    exemplar: { rect: [0.004, 1 - 0.99, 0.112, 1 - 0.76], tile: [16, 30] }, landShear: 0.18,
-  });
-  const terrainId = tmat.uniforms.uObjId.value;
-  S.add(new THREE.Mesh(terrainGeometry(height, 5200, 340, { x: 0, z: 0 }, 0.08), tmat));
+    exemplar: { rect: [0.004, 0.01, 0.112, 0.24], scale: 0.02, patch: 4 },
+  })));
 
   // Church spire rising above the hills: a slim painted card at the church's distance
   const cd = canvas.dir(0.535, 0.862);
@@ -2995,12 +2742,15 @@ async function buildRhone() {
   const EYE = 6.5;
   const canvas = S.canvas = new Canvas({
     meta, tex, fov: 50, pos: V3(0, EYE, 0), yaw: 0, pitch: -3.7 * DEG,
-    flowAmt: 9, flowRate: 0.12, currents: 0.18, relief: 1.4, shimmer: 1, discardFar: 60, skyBand: 0.3, landBand: 0.5, extNear: [18, 40],
+    flowAmt: 9, flowRate: 0.12, currents: 0.18, relief: 1.4, shimmer: 1, discardFar: 60, extNear: [18, 40], patch: 0.07, extLodMax: 5.5, farDev: 0.4,
   });
+  await buildExtension(canvas, tex, { seed: 7 });
+  // the skyline of Arles across the river; past the frame the far bank flattens out
+  const skyEl = canvas.setHorizon(meta.skyline, { amp: 0.35, seed: 2, reach: 40 });
   S.fov = 50;
   S.far = 9000;
   const env = S.env = new Env({ keyDir: [0.2, 0.7, 0.6], key: 0.45, amb: 0.2, wrap: 0.6, fogCol: '#1c3f6e', fogNear: 600, fogFar: 4000 });
-  S.look = { ink: '#0a1a38', inkPx: 1.8, impasto: 1.6, gloss: 0.3, sat: 1.05, bright: 1.0, vig: 0.4, vigCol: '#4e6490', mist: '#6fa0c8', paintImpasto: 0.9 };
+  S.look = { ink: '#0a1a38', inkPx: 1.8, impasto: 1.6, gloss: 0.3, sat: 1.02, bright: 1.0, vig: 0.35, vigCol: '#4e6490', mist: '#6fa0c8', paintImpasto: 0.9 };
 
   const hitY = (u, v, h) => { const d = canvas.dir(u, v); return canvas.pos.clone().addScaledVector(d, (h - EYE) / d.y); };
   const camDepth = (p) => -p.clone().applyMatrix4(canvas.cam.matrixWorldInverse).z;
@@ -3036,41 +2786,37 @@ async function buildRhone() {
   S.ground = height;
   S.bounds = { fn: (p) => { p.x = clamp(p.x, -40, 40); p.z = clamp(p.z, zWater(p.x) + 0.8, 14); } };
 
-  // ---- Sky
-  S.add(skyMesh(env, {
-    canvas, cell: 0.016, len: 0.8, wid: 0.3,
-    sky: ['#0a1c3e', '#123463', '#1c4f82', '#2c6c96', '#5a93a8', '#a9c9b8'],
-    glow: ['#7f9a52', '#b9c25a', '#e2d25a', '#f2e288', '#faf0b8', '#fffbe8'],
-    horizonV: 0.7, zenithV: 0.22, band: 0.08, wave: 0.4, arm: 0, mottle: 0.1, starStyle: 1, coreK: 0.18, smallStars: 0.18,
-    vortices: [], stars: [[80, 30, 2.4, 1], [110, 44, 2.0, 0.9], [150, 26, 2.2, 1], [-80, 36, 2.4, 1], [-120, 22, 2.0, 0.9], [-160, 40, 2.2, 1], [180, 56, 2.0, 0.9]],
-  }));
+  S.add(skyMesh(env, { canvas }));
 
   // ---- World (layer 1): water, the near bank and the far bank of Arles
-  const worldMat = (extra = {}) => groundMaterial(env, {
-    canvas, layer: 1,
-    base: ['#0a1830', '#122a4a', '#1a3f5e', '#2a5a6a', '#4a7a6a', '#8aa878'],
-    cell: 0.35, len: 0.9, wid: 0.28, dirAng: 0.0,
-    exemplar: { rect: [0.30, 1 - 0.99, 0.70, 1 - 0.86], tile: [9, 4] }, landShear: 0.12,
-    ...extra,
-  });
-  const water = new THREE.Mesh(new THREE.PlaneGeometry(6000, 6000, 1, 1).rotateX(-Math.PI / 2).translate(0, 0, -2900), worldMat({ water: true, exemplar: null }));
-  S.add(water);
-  S.add(new THREE.Mesh(terrainGeometry(height, 900, 260, { x: 0, z: -10 }, 0.12), worldMat()));
-  // far bank: a vertical ribbon standing on the painted waterline, tall enough to hold the town
+  const worldMat = (extra = {}) => groundMaterial(env, { canvas, layer: 1, ...extra });
+  await breathe();
+  S.add(new THREE.Mesh(new THREE.PlaneGeometry(6000, 6000, 1, 1).rotateX(-Math.PI / 2).translate(0, 0, -2900), worldMat({ water: true })));
+  S.add(new THREE.Mesh(terrainGeometry(height, 900, 260, { x: 0, z: -10 }, 0.12), worldMat({
+    exemplar: { rect: [0.30, 0.01, 0.70, 0.14], scale: 0.03, patch: 3 },
+  })));
+  // far bank: a ribbon standing on the painted waterline and reaching just under the skyline (the sky
+  // paints the last sliver, so the skyline is Vincent's in the frame and continues smoothly past it)
   const far = meta.far.map(([u, v]) => hitY(u, v, 0)).sort((a, b) => a.x - b.x);
   const first = far[0], last = far[far.length - 1];
-  const dl = first.clone().sub(far[1]).normalize(), dr = last.clone().sub(far[far.length - 2]).normalize();
+  const dr = last.clone().sub(far[far.length - 2]).normalize();
   const ribbon = [];
   // beyond the canvas the river bends away: continue the far bank outward, never toward the painter
   for (let k = 4; k >= 1; k--) ribbon.push(first.clone().add(V3(-k * 90, 0, -k * 70)));
   ribbon.push(...far);
   for (let k = 1; k <= 6; k++) ribbon.push(last.clone().addScaledVector(dr, k * 160));
+  const top = (p) => {
+    const dx = p.x - canvas.pos.x, dz = p.z - canvas.pos.z, r = Math.hypot(dx, dz);
+    return Math.max(1.5, EYE + r * Math.tan((skyEl(Math.atan2(dx, -dz) / DEG) - 0.3) * DEG));
+  };
   const rpos = [];
   for (let i = 0; i < ribbon.length - 1; i++) {
-    const a = ribbon[i], b = ribbon[i + 1];
-    const top = (p) => Math.max(45, p.distanceTo(canvas.pos) * 0.16);
-    const quad = [[a, -3], [b, -3], [b, top(b)], [a, -3], [b, top(b)], [a, top(a)]];
-    for (const [p, y] of quad) rpos.push(p.x, y, p.z);
+    const steps = Math.max(1, Math.ceil(ribbon[i].distanceTo(ribbon[i + 1]) / 6));
+    for (let k = 0; k < steps; k++) {
+      const a = ribbon[i].clone().lerp(ribbon[i + 1], k / steps), b = ribbon[i].clone().lerp(ribbon[i + 1], (k + 1) / steps);
+      const quad = [[a, -3], [b, -3], [b, top(b)], [a, -3], [b, top(b)], [a, top(a)]];
+      for (const [p, y] of quad) rpos.push(p.x, y, p.z);
+    }
   }
   const rg = new THREE.BufferGeometry();
   rg.setAttribute('position', new THREE.Float32BufferAttribute(rpos, 3));
@@ -3129,13 +2875,14 @@ async function buildCafe() {
   const EYE = 1.65;
   const canvas = S.canvas = new Canvas({
     meta, tex, fov: 62, pos: V3(0, EYE, 0), yaw: 3.2 * DEG, pitch: 4.1 * DEG,
-    flowAmt: 3, flowRate: 0.12, relief: 1.2, skyBand: 0.3, landBand: 0.4, extNear: [0.0, 0.5], discardFar: 0,
+    flowAmt: 3, flowRate: 0.12, relief: 1.2, extNear: [14, 40], discardFar: 0, patch: 0.07, extLodMax: 5.0, brushwork: 0.85, farDev: 0.6,
   });
+  await buildExtension(canvas, tex, { seed: 9, starMinEl: 20 });
   S.fov = 62;
   S.near = 0.05; S.far = 6000;
   S.eye = EYE;
   const env = S.env = new Env({ keyDir: [0.3, 0.8, 0.5], key: 0.4, amb: 0.3, wrap: 0.6, fogCol: '#1c2350', fogNear: 200, fogFar: 1200 });
-  S.look = { ink: '#1a1433', inkPx: 1.6, impasto: 1.4, gloss: 0.3, sat: 1.05, bright: 1.0, vig: 0.4, vigCol: '#4a4270', mist: '#e0c070', paintImpasto: 0.8 };
+  S.look = { ink: '#1a1433', inkPx: 1.6, impasto: 1.4, gloss: 0.3, sat: 1.02, bright: 1.0, vig: 0.35, vigCol: '#4a4270', mist: '#e0c070', paintImpasto: 0.8 };
 
   const hitY = (u, v, h) => { const d = canvas.dir(u, v); return canvas.pos.clone().addScaledVector(d, (h - EYE) / d.y); };
   const hitX = (u, v, x) => { const d = canvas.dir(u, v); return canvas.pos.clone().addScaledVector(d, (x - canvas.pos.x) / d.x); };
@@ -3151,33 +2898,24 @@ async function buildCafe() {
   S.ground = (x, z) => (x < terraceRight && z < terraceFront && z > -30 ? TER : 0);
   S.bounds = { type: 'rect', x0: -WL + 0.35, x1: WR - 0.35, z0: END + 2, z1: 16 };
 
-  // ---- Sky
-  S.add(skyMesh(env, {
-    canvas, cell: 0.017, len: 0.8, wid: 0.3,
-    sky: ['#1a2358', '#26347a', '#3a4a96', '#5a6cb0', '#8a98c8', '#c8cce0'],
-    glow: ['#8a9a6a', '#c8c878', '#e8e090', '#f4f0b8', '#fbf8d8', '#ffffff'],
-    horizonV: 0.5, zenithV: 0.25, band: 0.05, wave: 0.3, arm: 0, mottle: 0.1, starStyle: 2, coreK: 0.2, smallStars: 0.12,
-    vortices: [], stars: [],
-  }));
+  S.add(skyMesh(env, { canvas }));
 
   // ---- The set (layer 1): street, terrace, facades and the far end of the street
-  const setMat = (extra = {}) => groundMaterial(env, {
-    canvas, layer: 1,
-    base: ['#1a1838', '#2c2a56', '#48407a', '#7a6a8a', '#b89a6a', '#e8c878'],
-    cell: 0.2, len: 0.7, wid: 0.36, dirMode: 1, dirAng: 0.0,
-    exemplar: { rect: [0.30, 1 - 0.985, 0.90, 1 - 0.86], tile: [3.2, 1.6] }, landShear: 0.08,
-    ...extra,
-  });
+  const setMat = (extra = {}) => groundMaterial(env, { canvas, layer: 1, ...extra });
   const quad = (a, b, c, d) => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([...a, ...b, ...c, ...a, ...c, ...d], 3)); g.computeVertexNormals(); return g; };
-  S.add(new THREE.Mesh(new THREE.PlaneGeometry(400, 400).rotateX(-Math.PI / 2).translate(0, 0, -100), setMat()));
-  const terrace = new THREE.Mesh(boxGeo(terraceRight + WL, TER, terraceFront + 30).translate((terraceRight - WL) / 2, 0, 0), setMat({ exemplar: null }));
+  S.add(new THREE.Mesh(new THREE.PlaneGeometry(400, 400).rotateX(-Math.PI / 2).translate(0, 0, -100), setMat({
+    exemplar: { rect: [0.30, 0.015, 0.90, 0.14], scale: 0.08, patch: 1.2 },   // his cobbles underfoot
+  })));
+  const terrace = new THREE.Mesh(boxGeo(terraceRight + WL, TER, terraceFront + 30).translate((terraceRight - WL) / 2, 0, 0), setMat());
   terrace.position.set(0, 0, (terraceFront - 30) / 2);
   S.add(terrace);
   const H1 = 16;
-  S.add(new THREE.Mesh(quad([-WL, 0, 18], [-WL, 0, END], [-WL, H1, END], [-WL, H1, 18]), setMat({ side: THREE.DoubleSide, exemplar: null })));
-  S.add(new THREE.Mesh(quad([WR, 0, END], [WR, 0, 18], [WR, H1, 18], [WR, H1, END]), setMat({ side: THREE.DoubleSide, exemplar: null })));
-  S.add(new THREE.Mesh(quad([-WL, 0, END], [WR, 0, END], [WR, H1, END], [-WL, H1, END]), setMat({ side: THREE.DoubleSide, exemplar: null })));
-  S.add(new THREE.Mesh(quad([WR, 0, 18], [-WL, 0, 18], [-WL, H1, 18], [WR, H1, 18]), setMat({ side: THREE.DoubleSide, exemplar: null })));
+  // beyond the frame the street's walls carry the facades across the street, storey by storey
+  const wallMat = () => setMat({ side: THREE.DoubleSide, maskUp: true, exemplar: { rect: [0.66, 0.45, 0.97, 0.88], scale: 0.036, patch: 2, wall: true, rowH: 12 } });
+  S.add(new THREE.Mesh(quad([-WL, 0, 18], [-WL, 0, END], [-WL, H1, END], [-WL, H1, 18]), wallMat()));
+  S.add(new THREE.Mesh(quad([WR, 0, END], [WR, 0, 18], [WR, H1, 18], [WR, H1, END]), wallMat()));
+  S.add(new THREE.Mesh(quad([-WL, 0, END], [WR, 0, END], [WR, H1, END], [-WL, H1, END]), wallMat()));
+  S.add(new THREE.Mesh(quad([WR, 0, 18], [-WL, 0, 18], [-WL, H1, 18], [WR, H1, 18]), wallMat()));
 
   // ---- Awning and tree (layer 3)
   const topMat = paintMaterial(env, { canvas, layer: 3, side: THREE.DoubleSide, ramps: [['#6a4a10', '#a07018', '#d0a020', '#e8c030', '#f4dc60', '#fff0a0']], cell: 0.2 });
@@ -3194,7 +2932,7 @@ async function buildCafe() {
   aw.computeVertexNormals();
   S.add(new THREE.Mesh(paintGeo(aw, 0, 0.2, 0), topMat));
   const treeDepth = camDepth(V3(WR - 1.6, 5, -13));
-  const treeGeo = paintGeo(canvasCard(canvas, meta.tree, treeDepth, 1.2), 0, 0.3, 0);
+  const treeGeo = paintGeo(canvasCard(canvas, meta.tree, treeDepth, 1.2, 0.12), 0, 0.3, 0);
   S.add(new THREE.Mesh(treeGeo, topMat));
   // its trunk stands below the canvas edge
   const tb = canvas.at(0.93, 0.36, treeDepth);
@@ -3249,14 +2987,15 @@ async function buildBedroom() {
   const EYE = 1.55;
   const canvas = S.canvas = new Canvas({
     meta, tex, fov: 64, pos: V3(0, EYE, 2.6), yaw: 0, pitch: -18 * DEG,
-    flowAmt: 0, flowRate: 0, relief: 1.5, discardFar: 0, skyBand: 0.3, landBand: 0.4, extNear: [1e5, 2e5],
+    flowAmt: 0, flowRate: 0, relief: 1.5, discardFar: 0, extNear: [1e5, 2e5], patch: 0.08,
   });
+  await buildExtension(canvas, tex, { seed: 13 });
   S.fov = 64;
   S.near = 0.05; S.far = 200;
   S.eye = EYE;
   S.walkScale = 0.6;
   const env = S.env = new Env({ keyDir: [-0.3, 0.6, 0.75], key: 0.5, amb: 0.45, wrap: 0.6, fogCol: '#9a9ac8', fogNear: 60, fogFar: 200 });
-  S.look = { ink: '#2a2238', inkPx: 1.6, impasto: 1.6, gloss: 0.3, sat: 1.04, bright: 1.0, vig: 0.3, vigCol: '#8a8ab0', mist: '#e8d890', paintImpasto: 0.9 };
+  S.look = { ink: '#2a2238', inkPx: 1.6, impasto: 1.6, gloss: 0.3, sat: 1.02, bright: 1.0, vig: 0.3, vigCol: '#8a8ab0', mist: '#e8d890', paintImpasto: 0.9 };
 
   const hitY = (u, v, h) => { const d = canvas.dir(u, v); return canvas.pos.clone().addScaledVector(d, (h - EYE) / d.y); };
   const camDepth = (p) => -p.clone().applyMatrix4(canvas.cam.matrixWorldInverse).z;
@@ -3269,20 +3008,16 @@ async function buildBedroom() {
   const HGT = 3.3;
   const quad = (a, b, c, d) => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([...a, ...b, ...c, ...a, ...c, ...d], 3)); g.computeVertexNormals(); return g; };
   // beyond the painted frame, walls and ceiling carry Vincent's pale violet wall paint, the floor his boards
-  const WALL = { rect: [0, 0, 1, 1], tile: [1.3, 1.3], wall: true, tex: tex.wallTex };
-  const FLOOR = { rect: [0, 0, 1, 1], tile: [2.2, 2.2], tex: tex.floorTex };
-  const roomMat = (extra = {}) => groundMaterial(env, {
-    canvas, layer: 1, side: THREE.DoubleSide,
-    base: ['#6a5a8a', '#8a7aaa', '#a09ac8', '#b8b4d8', '#ccc8e4', '#e2def0'],
-    cell: 0.12, len: 0.8, wid: 0.3, dirMode: 1, dirAng: 1.57, exemplar: WALL, ...extra,
-  });
+  const WALL = { tex: tex.wallTex, tile: 1.3, patch: 0.6, wall: true };
+  const FLOOR = { tex: tex.floorTex, tile: 2.2, patch: 0.9 };
+  const roomMat = (extra = {}) => groundMaterial(env, { canvas, layer: 1, side: THREE.DoubleSide, exemplar: WALL, ...extra });
   const A = [LW.x, 0, LW.z], B = [RW.x, 0, RW.z];
   S.add(new THREE.Mesh(quad([fl.x, 0, fl.z], [fr.x, 0, fr.z], B, A), roomMat({ exemplar: FLOOR })));
   S.add(new THREE.Mesh(quad(A, B, [RW.x, HGT, RW.z], [LW.x, HGT, LW.z]), roomMat()));
   S.add(new THREE.Mesh(quad([fl.x, 0, fl.z], A, [LW.x, HGT, LW.z], [fl.x, HGT, fl.z]), roomMat()));
   S.add(new THREE.Mesh(quad(B, [fr.x, 0, fr.z], [fr.x, HGT, fr.z], [RW.x, HGT, RW.z]), roomMat()));
   S.add(new THREE.Mesh(quad([fr.x, 0, fr.z], [fl.x, 0, fl.z], [fl.x, HGT, fl.z], [fr.x, HGT, fr.z]), roomMat()));
-  S.add(new THREE.Mesh(quad([fl.x, HGT, fl.z], [LW.x, HGT, LW.z], [RW.x, HGT, RW.z], [fr.x, HGT, fr.z]), roomMat({ base: ['#8a8aa8', '#a0a0c0', '#b8b8d4', '#cacae0', '#dadaea', '#ececf4'] })));
+  S.add(new THREE.Mesh(quad([fl.x, HGT, fl.z], [LW.x, HGT, LW.z], [RW.x, HGT, RW.z], [fr.x, HGT, fr.z]), roomMat({ exemplar: { ...WALL, wall: false } })));
 
   const inside = (p) => {
     // keep the viewer within the quadrilateral floor (left, back, right walls; front wall)
@@ -3300,7 +3035,7 @@ async function buildBedroom() {
   const furnMat = (layer) => paintMaterial(env, { canvas, layer, side: THREE.DoubleSide, ramps: [['#6a4a10', '#9a6a18', '#c89028', '#e0b040', '#f0d070', '#fff0b0']], cell: 0.028, len: 0.95, wid: 0.28 });
   const place = (poly, footU, footV, thick, layer) => {
     const foot = hitY(footU, footV, 0);
-    const g = paintGeo(canvasCard(canvas, poly, camDepth(foot), thick), 0, 0.5, 0);
+    const g = paintGeo(canvasCard(canvas, poly, camDepth(foot), thick, 0.06), 0, 0.5, 0);
     S.add(new THREE.Mesh(g, furnMat(layer)));
     return foot;
   };
@@ -3535,7 +3270,7 @@ class Soundscape {
     this._clk = now + 0.8 + Math.random() * 3.5;
     const ctx = this.ctx, f = 2600 + Math.random() * 1800;
     [1, 2.76, 5.4].forEach((m, i) => {
-      const o = ctx.createOscillator(); o.frequency.value = f * m;
+      const o = ctx.createOscillator(); o.frequency.value = Math.min(f * m, ctx.sampleRate * 0.45);
       const g = this.gain(0);
       g.gain.setValueAtTime(0, now); g.gain.linearRampToValueAtTime(0.012 / (i + 1), now + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, now + 0.5 - i * 0.12);
       o.connect(g); g.connect(out); g.connect(this.verb);
@@ -3564,6 +3299,57 @@ class Soundscape {
       o.start(t0); o.stop(t0 + 0.12);
     }
   }
+  // ---- footsteps: grass on the hill, grit on the quay, cobbles at the café, boards in the bedroom
+  step(kind, amt, foot) {
+    if (!this.ctx || !this.on || this.cur < 0) return;
+    const ctx = this.ctx, t = ctx.currentTime + 0.005;
+    const surface = ['grass', 'grit', 'cobble', 'wood'][this.cur] || 'grass';
+    const land = kind === 'land';
+    const level = (land ? 1.4 : 1) * clamp(amt, 0.3, 1.5) * (0.85 + Math.random() * 0.3);
+    const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+    const out = pan || this.master;
+    if (pan) { pan.pan.value = (foot ? 0.12 : -0.12) + (Math.random() - 0.5) * 0.06; pan.connect(this.master); }
+    const burst = (f, q, dur, gain, delay = 0) => {
+      const n = this.src(this.noiseBuf, false);
+      const bp = this.filt('bandpass', f * (0.9 + Math.random() * 0.2), q);
+      const g = this.gain(0);
+      g.gain.setValueAtTime(0, t + delay); g.gain.linearRampToValueAtTime(gain * level, t + delay + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + delay + dur);
+      n.connect(bp).connect(g).connect(out);
+      n.stop(t + delay + dur + 0.05);
+    };
+    const thud = (f0, f1, dur, gain) => {
+      const o = ctx.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+      const g = this.gain(0);
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain * level, t + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g).connect(out); o.start(t); o.stop(t + dur + 0.02);
+    };
+    if (surface === 'grass') {
+      burst(1900, 0.7, 0.16, 0.05); burst(3800, 1.2, 0.08, 0.02, 0.02); thud(80, 50, 0.08, 0.05);
+    } else if (surface === 'grit') {
+      burst(3200, 0.9, 0.1, 0.045);
+      for (let k = 0; k < 3; k++) burst(5200 + Math.random() * 1800, 3, 0.025, 0.015, 0.01 + Math.random() * 0.06);
+      thud(95, 60, 0.06, 0.05);
+    } else if (surface === 'cobble') {
+      burst(2400, 2.2, 0.035, 0.05); burst(900, 1.2, 0.05, 0.03); thud(120, 70, 0.06, 0.07);
+    } else {
+      thud(105, 62, 0.11, 0.09); burst(620, 1.4, 0.07, 0.035);
+      if (Math.random() < 0.12) {
+        // now and then a board answers
+        const o = ctx.createOscillator(); o.type = 'sawtooth';
+        const f = 170 + Math.random() * 60;
+        o.frequency.setValueAtTime(f, t + 0.05); o.frequency.linearRampToValueAtTime(f * 1.35, t + 0.32);
+        const bp = this.filt('bandpass', 900, 5);
+        const g = this.gain(0);
+        g.gain.setValueAtTime(0, t + 0.05); g.gain.linearRampToValueAtTime(0.012, t + 0.12); g.gain.linearRampToValueAtTime(0, t + 0.34);
+        o.connect(bp).connect(g).connect(out); g.connect(this.verb);
+        o.start(t + 0.05); o.stop(t + 0.36);
+      }
+    }
+  }
+
   events() {
     if (!this.ctx || !this.on || this.cur < 0) return;
     const now = this.ctx.currentTime + 0.05;
@@ -3629,7 +3415,6 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPrefer
 renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.autoClear = false;
-FLOAT_LINEAR = !!renderer.extensions.get('OES_texture_float_linear');
 
 const pipeline = new Pipeline(renderer);
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 6000);
@@ -3647,22 +3432,50 @@ let started = false;
 let clockT = 0;
 const params = new URLSearchParams(location.search);
 const DEBUG = params.has('debug');
-if (DEBUG) window.__dw = { scenes, pipeline, renderer, camera, player, THREE, get dpr() { return dpr; }, set dpr(v) { dpr = v; resize(); } };
+if (DEBUG) window.__dw = { scenes, pipeline, renderer, camera, player, THREE, get scale() { return res.scale; }, set scale(v) { res.scale = v; } };
 
-// ----- Resolution (adapts to keep the frame rate smooth)
-const maxDpr = Math.min(devicePixelRatio || 1, 2);
-let dpr = Math.min(maxDpr, 1.5);
-if (params.has('dpr')) dpr = parseFloat(params.get('dpr'));
+// ----- Resolution. The canvas keeps one size; the scene renders into a fraction of it (res.scale) that
+// follows the GPU's load, so the frame rate holds without ever reallocating a buffer mid-walk.
+const dpr = params.has('dpr') ? parseFloat(params.get('dpr')) : Math.min(devicePixelRatio || 1, 1.5);
+const res = { scale: 1, fixed: params.has('dpr'), min: 0.42, last: 0, calm: 0, ceiling: 1 };
 function resize() {
   renderer.setPixelRatio(dpr);
   renderer.setSize(innerWidth, innerHeight, false);
   const b = renderer.getDrawingBufferSize(new THREE.Vector2());
   pipeline.setSize(b.x, b.y);
+  // start from a pixel budget most GPUs carry at full speed, then let the measurements decide
+  if (!res.fixed && !res.last) res.scale = clamp(Math.sqrt(2.0e6 / (b.x * b.y)), res.min, 1);
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
 }
 addEventListener('resize', resize);
 resize();
+
+// GPU time of each frame, where the browser exposes it (EXT_disjoint_timer_query_webgl2).
+class GpuTimer {
+  constructor(gl) { this.gl = gl; this.ext = gl.getExtension('EXT_disjoint_timer_query_webgl2'); this.queue = []; this.active = null; this.ms = null; }
+  begin() {
+    if (!this.ext || this.active || this.queue.length > 4) return;
+    this.active = this.gl.createQuery();
+    this.gl.beginQuery(this.ext.TIME_ELAPSED_EXT, this.active);
+  }
+  end() {
+    if (!this.active) return;
+    this.gl.endQuery(this.ext.TIME_ELAPSED_EXT);
+    this.queue.push(this.active); this.active = null;
+  }
+  poll() {
+    const gl = this.gl;
+    while (this.queue.length && gl.getQueryParameter(this.queue[0], gl.QUERY_RESULT_AVAILABLE)) {
+      const q = this.queue.shift();
+      const ns = gl.getQueryParameter(q, gl.QUERY_RESULT);
+      gl.deleteQuery(q);
+      if (!gl.getParameter(this.ext.GPU_DISJOINT_EXT)) this.ms = this.ms == null ? ns / 1e6 : lerp(this.ms, ns / 1e6, 0.15);
+    }
+    return this.ms;
+  }
+}
+const gpuTimer = new GpuTimer(renderer.getContext());
 
 // ----- Transition state
 const trans = { active: false, t: 0, dur: 3.8, to: 0, switched: false, basin: false, from: null, spin: 1, dir: V3() };
@@ -3813,6 +3626,8 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyP' && DEBUG) console.log(JSON.stringify({ p: player.pos.toArray().map((v) => +v.toFixed(2)), yaw: +player.yaw.toFixed(3), pitch: +player.pitch.toFixed(3) }));
 });
 
+player.onStep = (kind, amt, foot) => sound.step(kind, amt, foot);
+
 const lookHint = $('#lookhint');
 player.onLockChange = (locked) => {
   if (!started) return;
@@ -3875,18 +3690,33 @@ function makeThumb(S) {
   return c2.toDataURL('image/jpeg', 0.85);
 }
 
+function sceneTextures(S) {
+  const set = new Set();
+  S.scene.traverse((o) => {
+    const u = o.material && o.material.uniforms;
+    if (u) for (const k in u) { const v = u[k].value; if (v && v.isTexture) set.add(v); }
+  });
+  return [...set];
+}
+
 // ----- Boot
 const bar = $('#progress-bar');
-const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
 async function boot() {
   const total = BUILDERS.length;
   const want = params.has('scene') ? clamp(parseInt(params.get('scene'), 10) || 0, 0, total - 1) : 0;
   const order = [want, ...BUILDERS.map((_, i) => i).filter((i) => i !== want)];
   let loaded = 0;
-  const loadOne = async (i) => {
+  const loadOne = async (i, background) => {
     const S = await BUILDERS[i]();
-    scenes[i] = S;
+    if (background) {
+      // While someone is walking: upload its textures a frame at a time and compile its shaders off the
+      // main thread, so the painting arrives without a stall.
+      for (const t of sceneTextures(S)) { renderer.initTexture(t); await nextFrame(); }
+      try { await renderer.compileAsync(S.scene, camera); } catch (err) { console.warn('compile', err); }
+      await nextFrame();
+    }
     try { S.thumb = makeThumb(S); } catch (err) { console.warn('thumb failed', err); }
+    scenes[i] = S;
     loaded++;
     bar.style.width = `${(loaded / total) * 100}%`;
     buildMemoryBar();
@@ -3906,7 +3736,7 @@ async function boot() {
   if (params.has('go')) startExperience(true);
   // the other memories arrive while you look at the first one
   for (const i of order.slice(1)) {
-    try { await loadOne(i); } catch (err) { console.warn('Could not load painting', i, err); }
+    try { await loadOne(i, true); } catch (err) { console.warn('Could not load painting', i, err); }
     await nextFrame();
   }
   $('#progress').classList.add('done');
@@ -3926,14 +3756,43 @@ function startExperience(skip = false) {
   lookHint.hidden = true;
 }
 
+// ----- Resolution control: keep the GPU inside the display's frame time.
+const frames = { list: [], interval: 1000 / 60 };
+function adaptResolution(now, ms) {
+  if (ms < 100) { frames.list.push(ms); if (frames.list.length > 90) frames.list.shift(); }   // longer gaps are loading, not drawing
+  const gpu = gpuTimer.poll();
+  if (res.fixed || now - res.last < 500 || frames.list.length < 30) return;
+  const sorted = [...frames.list].sort((a, b) => a - b);
+  frames.interval = lerp(frames.interval, clamp(sorted[Math.floor(sorted.length * 0.1)], 6.5, 34), 0.3);   // the refresh rate, roughly
+  const budget = frames.interval * 0.82;
+  let s = res.scale;
+  if (gpu != null) {
+    if (gpu > budget) s *= clamp(Math.sqrt(budget / gpu), 0.8, 0.97);
+    else if (gpu < budget * 0.6) s *= 1.04;
+  } else {
+    // without a GPU clock: late frames mean too much work; a long run of on-time frames earns a careful step up,
+    // never straight back to a level that was already too much
+    const late = frames.list.filter((d) => d > frames.interval * 1.4).length / frames.list.length;
+    if (late > 0.1) { res.ceiling = res.scale * 0.98; s *= 0.9; res.calm = 0; }
+    else if (late < 0.02) {
+      res.calm += 1;
+      if (res.calm % 10 === 0) res.ceiling = Math.min(1, res.ceiling * 1.02);
+      if (res.calm > 6 && s < res.ceiling) { s = Math.min(res.ceiling, s * 1.03); res.calm = 0; }
+    }
+  }
+  res.scale = clamp(s, res.min, 1);
+  res.last = now;
+}
+
 // ----- Loop
 let last = performance.now();
-let frameAvg = 16, frameCount = 0, lastAdapt = 0;
+let frameAvg = 16, frameCount = 0;
 const fpsEl = $('#fps');
 if (DEBUG) fpsEl.hidden = false;
 function loop(now) {
   requestAnimationFrame(loop);
-  let dt = Math.min(0.05, (now - last) / 1000);
+  const ms = now - last;
+  let dt = Math.min(0.05, ms / 1000);
   last = now;
   clockT += dt;
   const S = scenes[current];
@@ -3950,11 +3809,12 @@ function loop(now) {
   player.apply(camera);
   camera.updateMatrixWorld();
   scenes[current].update(clockT, dt, camera);
-  scenes[current].env.shared.uCellPx.value = 17 * dpr;
-  pipeline.mat.uniforms.uInkPx.value = scenes[current].look.inkPx * dpr;
+  pipeline.mat.uniforms.uInkPx.value = scenes[current].look.inkPx * dpr * res.scale;
   if (reveal.t < 0) pipeline.mat.uniforms.uHideWorld.value = 1;
   else { reveal.t += dt; pipeline.mat.uniforms.uHideWorld.value = 1 - smooth(reveal.hold, reveal.hold + reveal.dur, reveal.t); }
-  pipeline.render(scenes[current].scene, camera, clockT, dpr);
+  gpuTimer.begin();
+  pipeline.render(scenes[current].scene, camera, clockT, dpr, null, pipeline.rt, res.scale);
+  gpuTimer.end();
 
   // Silver pool prompt
   if (started) {
@@ -3968,13 +3828,12 @@ function loop(now) {
     if (!hintHidden && player.moved > 60 && clockT > 30) setHint(false);
   }
 
-  // Adaptive resolution
+  adaptResolution(now, ms);
   frameAvg = lerp(frameAvg, dt * 1000, 0.05);
   frameCount++;
-  if (DEBUG && frameCount % 15 === 0) fpsEl.textContent = `${(1000 / frameAvg).toFixed(0)} fps · ${dpr.toFixed(2)}x · ${pipeline.size.x}×${pipeline.size.y}`;
-  if (!params.has('dpr') && now - lastAdapt > 1500 && frameCount > 90) {
-    if (frameAvg > 24 && dpr > 0.55) { dpr = Math.max(0.55, dpr * 0.85); resize(); lastAdapt = now; }
-    else if (frameAvg < 14.5 && dpr < maxDpr) { dpr = Math.min(maxDpr, dpr * 1.1); resize(); lastAdapt = now; }
+  if (DEBUG && frameCount % 15 === 0) {
+    const g = gpuTimer.ms;
+    fpsEl.textContent = `${(1000 / frameAvg).toFixed(0)} fps · ${(dpr * res.scale).toFixed(2)}x · ${Math.round(pipeline.size.x * res.scale)}×${Math.round(pipeline.size.y * res.scale)}${g != null ? ` · gpu ${g.toFixed(1)} ms` : ''}`;
   }
 }
 
