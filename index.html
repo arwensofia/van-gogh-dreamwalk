@@ -1851,9 +1851,12 @@ void main(){
   vec3 graded = mix(vec3(l), col, uSat) * uBright;
   float vg = smoothstep(0.4, 1.25, length((vUv - 0.5) * vec2(aspect, 1.0)) * 1.15);
   col = mix(graded, graded * uVigCol, vg * uVig);
-  // arrival: only Vincent's own frame glows at first, then the world spreads out from it
+  // arrival: only Vincent's own frame glows at first, then the world spreads out from it with an uneven,
+  // brushed edge
   float rv = 1.05 * (1.0 - uHideWorld);
-  float vis = smoothstep(0.75 - rv, 0.95 - rv, painted);
+  vec2 rq = suv * vec2(aspect, 1.0);
+  float rn = vnoise(rq * 5.0 + 11.0) * 0.6 + vnoise(rq * 13.0 + 3.0) * 0.4;
+  float vis = smoothstep(0.75 - rv, 0.95 - rv, painted - (rn - 0.5) * 0.4 * (1.0 - smoothstep(0.85, 1.0, painted)));
   col = mix(col * 0.07 + vec3(0.01, 0.012, 0.03), col, vis);
   col += (hash12(gl_FragCoord.xy + fract(uTime) * 91.0) - 0.5) * 0.02;
 
